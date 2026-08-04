@@ -360,9 +360,14 @@ pub struct ReplicationConfig {
     /// Optional LSN to stop replication at.
     ///
     /// When set, replication will stop once a commit with `end_lsn >= stop_at_lsn`
-    /// is received. Useful for:
+    /// is received. The full transaction containing that commit is delivered
+    /// first, so replay always ends on a transaction boundary. Useful for:
     /// - Bounded replay (e.g., point-in-time recovery)
     /// - Testing with known data ranges
+    ///
+    /// For payloads with no recognizable commit boundary (a non-`pgoutput`
+    /// output plugin), the raw `XLogData` `wal_end` is used as a fallback, which
+    /// can stop mid-transaction.
     ///
     /// If `None`, replication continues indefinitely (normal CDC mode).
     pub stop_at_lsn: Option<Lsn>,
@@ -373,7 +378,7 @@ pub struct ReplicationConfig {
     /// allowing the server to release WAL segments. Too infrequent updates
     /// may cause WAL accumulation; too frequent updates add overhead.
     ///
-    /// Default: 1 second (matches pg_recvlogical)
+    /// Default: 10 seconds
     pub status_interval: Duration,
 
     /// Maximum time to wait for server messages before waking up.

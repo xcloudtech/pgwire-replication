@@ -40,7 +40,9 @@ pgwire-replication = { version = "0.4.0", default-features = false, features = [
 ## Requirements
 
 - Rust 1.88 or later
-- PostgreSQL 15+ with logical replication enabled (older versions will probably work too)
+- PostgreSQL 14 or later, with logical replication enabled. The `messages 'true'`
+  option this client always requests was added in PostgreSQL 14, so PostgreSQL 13
+  and older reject `START_REPLICATION`. Tested against 15+.
 
 ## Features
 
@@ -82,15 +84,25 @@ let mut repl = ReplicationClient::connect(config).await?;
 
 while let Some(event) = repl.recv().await? {
     match event {
-        ReplicationEvent::XLogData { wal_end, data, .. } => {
-            process(data);
-            repl.update_applied_lsn(wal_end);
+        ReplicationEvent::Begin { .. } => {}
+        ReplicationEvent::XLogData { data, .. } => process(data),
+
+        // Commit is the durability boundary: report progress here, once this
+        // transaction's changes are persisted.
+        ReplicationEvent::Commit { end_lsn, .. } => {
+            flush();
+            repl.update_applied_lsn(end_lsn);
         }
-        ReplicationEvent::KeepAlive { .. } => {}
+
+        // KeepAlive carries the server's real WAL end. Confirming it is what
+        // lets PostgreSQL release WAL while your publication is idle but the
+        // database is not.
+        ReplicationEvent::KeepAlive { wal_end, .. } => repl.update_applied_lsn(wal_end),
+
         ReplicationEvent::Message { prefix, content, .. } => {
             // User-defined message from pg_logical_emit_message()
             handle_message(prefix, content);
-        }        
+        }
         ReplicationEvent::StoppedAt { reached } => break,
     }
 }
@@ -165,7 +177,21 @@ This allows callers to control:
 Updates are **monotonic**: reporting an older LSN is a no-op.
 Standby status updates are sent asynchronously by the worker using the
 latest applied LSN, based on `status_interval` or server keepalive requests.
-For CDC pipelines, progress should typically be reported at **transaction commit boundaries**, not for every message.
+
+### Which LSN to report
+
+Report **`Commit.end_lsn`** and **`KeepAlive.wal_end`**, not `XLogData.wal_end`:
+
+- `Commit { end_lsn }` is the transaction boundary. Confirming it tells PostgreSQL
+  the whole transaction is durable, which is what advances the slot's
+  `confirmed_flush_lsn`.
+- `KeepAlive { wal_end }` is the server's **actual** current WAL end. Confirming it
+  is the only way the slot advances while your publication is idle but the database
+  is not — otherwise WAL accumulates behind the slot indefinitely.
+- `XLogData.wal_end` is **not** the server's WAL end. For logical replication the
+  walsender sets it to the individual change's own LSN (and to 0 for every write
+  but the last of a record), so it never advances past a commit. Confirming it is
+  safe but leaves you permanently one transaction behind.
 
 ## Backpressure
 
@@ -384,7 +410,6 @@ async fn main() -> anyhow::Result<()> {
             Ok(Some(ev)) => match ev {
                 ReplicationEvent::XLogData { wal_end, data, .. } => {
                     println!("XLogData wal_end={wal_end} bytes={}", data.len());
-                    client.update_applied_lsn(wal_end);
                 }
                 ReplicationEvent::KeepAlive {
                     wal_end,
@@ -392,13 +417,17 @@ async fn main() -> anyhow::Result<()> {
                     ..
                 } => {
                     println!("KeepAlive wal_end={wal_end} reply_requested={reply_requested}");
+                    client.update_applied_lsn(wal_end);
                 }
                 ReplicationEvent::StoppedAt { reached } => {
                     println!("StoppedAt reached={reached}");
                     // break is optional; the stream should end shortly anyway
                     break;
                 }
-                ReplicationEvent::Begin { .. } | ReplicationEvent::Commit { .. } => {}
+                ReplicationEvent::Begin { .. } => {}
+                ReplicationEvent::Commit { end_lsn, .. } => {
+                    client.update_applied_lsn(end_lsn);
+                }
                 ReplicationEvent::Message { prefix, content, .. } => {
                     println!("Message prefix={prefix:?} bytes={}", content.len());
                 }

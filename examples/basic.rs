@@ -40,7 +40,6 @@ pub async fn main() -> anyhow::Result<()> {
             Ok(Some(ev)) => match ev {
                 ReplicationEvent::XLogData { wal_end, data, .. } => {
                     println!("XLogData wal_end={wal_end} bytes={}", data.len());
-                    repl.update_applied_lsn(wal_end);
                 }
                 ReplicationEvent::KeepAlive {
                     wal_end,
@@ -48,6 +47,10 @@ pub async fn main() -> anyhow::Result<()> {
                     ..
                 } => {
                     println!("KeepAlive wal_end={wal_end} reply_requested={reply_requested}");
+                    // A keepalive carries the server's real WAL end. Confirming it is
+                    // what lets PostgreSQL release WAL while this publication is idle
+                    // but the database is not.
+                    repl.update_applied_lsn(wal_end);
                 }
                 ReplicationEvent::StoppedAt { reached } => {
                     println!("StoppedAt reached={reached}");
@@ -55,7 +58,10 @@ pub async fn main() -> anyhow::Result<()> {
                 }
                 ReplicationEvent::Begin { xid, .. } => println!("Transaction started, xid={xid}"),
                 ReplicationEvent::Commit { end_lsn, .. } => {
-                    print!("Transaction finished, end_lsn={end_lsn}")
+                    println!("Transaction finished, end_lsn={end_lsn}");
+                    // Commit is the durability boundary: confirm progress here, once
+                    // this transaction's changes are persisted.
+                    repl.update_applied_lsn(end_lsn);
                 }
                 ReplicationEvent::Message {
                     transactional,

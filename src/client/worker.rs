@@ -11,7 +11,7 @@ use crate::error::{PgWireError, Result};
 use crate::lsn::Lsn;
 use crate::protocol::framing::{
     read_backend_message, write_copy_data, write_copy_done, write_password_message, write_query,
-    write_startup_message, MessageReader,
+    write_startup_message, BackendMessage, MessageReader,
 };
 use crate::protocol::messages::{parse_auth_request, parse_error_response};
 use crate::protocol::replication::{
@@ -81,7 +81,11 @@ pub enum ReplicationEvent {
     XLogData {
         /// WAL position where this data starts
         wal_start: Lsn,
-        /// WAL end position (may be 0 for mid-transaction messages)
+        /// **Not** the server's current WAL end. For logical replication the
+        /// walsender reports the individual change's own LSN here, and 0 for
+        /// every write but the last of a record. Report
+        /// [`Commit::end_lsn`](Self::Commit) or [`KeepAlive::wal_end`](Self::KeepAlive)
+        /// to advance the slot, not this.
         wal_end: Lsn,
         /// Server timestamp (microseconds since 2000-01-01)
         server_time_micros: i64,
@@ -192,7 +196,7 @@ impl WorkerState {
         let sql = format!(
             "START_REPLICATION SLOT {} LOGICAL {} \
             (proto_version '1', publication_names '{}', messages 'true'{})",
-            self.cfg.slot,
+            quote_ident(&self.cfg.slot),
             self.cfg.start_lsn,
             self.cfg.publication.to_option_value(),
             binary_opt,
@@ -205,8 +209,14 @@ impl WorkerState {
             match msg.tag {
                 b'W' => return Ok(()), // CopyBothResponse - ready to stream
                 b'E' => return Err(PgWireError::Server(parse_error_response(&msg.payload))),
-                b'N' | b'S' | b'K' => continue, // Notice, ParameterStatus, BackendKeyData
-                _ => continue,
+                // The command finished without entering COPY mode, so no stream
+                // is coming. Report it instead of blocking until the socket EOFs.
+                b'C' | b'Z' => {
+                    return Err(PgWireError::Protocol(
+                        "server completed START_REPLICATION without entering COPY mode".into(),
+                    ))
+                }
+                _ => continue, // Notice, ParameterStatus, BackendKeyData, ...
             }
         }
     }
@@ -254,18 +264,9 @@ impl WorkerState {
             while stream.buffer().len() >= 5 && drained < DRAIN_BATCH {
                 let msg = reader.read(stream).await?;
                 drained += 1;
-                if msg.tag == b'E' {
-                    return Err(PgWireError::Server(parse_error_response(&msg.payload)));
-                }
-                if msg.tag == b'd'
-                    && self
-                        .handle_copy_data(
-                            stream,
-                            msg.payload,
-                            &mut last_applied,
-                            &mut last_status_sent,
-                        )
-                        .await?
+                if self
+                    .handle_stream_message(stream, msg, &mut last_applied, &mut last_status_sent)
+                    .await?
                 {
                     return Ok(());
                 }
@@ -316,21 +317,40 @@ impl WorkerState {
                 }
             };
 
-            if msg.tag == b'E' {
-                return Err(PgWireError::Server(parse_error_response(&msg.payload)));
-            }
-            if msg.tag == b'd'
-                && self
-                    .handle_copy_data(
-                        stream,
-                        msg.payload,
-                        &mut last_applied,
-                        &mut last_status_sent,
-                    )
-                    .await?
+            if self
+                .handle_stream_message(stream, msg, &mut last_applied, &mut last_status_sent)
+                .await?
             {
                 return Ok(());
             }
+        }
+    }
+
+    /// Dispatch one backend message received during streaming.
+    ///
+    /// Returns true when the stream is finished and the loop should exit.
+    async fn handle_stream_message<S: AsyncRead + AsyncWrite + Unpin>(
+        &mut self,
+        stream: &mut BufReader<S>,
+        msg: BackendMessage,
+        last_applied: &mut Lsn,
+        last_status_sent: &mut Instant,
+    ) -> Result<bool> {
+        match msg.tag {
+            b'd' => {
+                self.handle_copy_data(stream, msg.payload, last_applied, last_status_sent)
+                    .await
+            }
+            b'E' => Err(PgWireError::Server(parse_error_response(&msg.payload))),
+            // The server ended the copy. Acknowledge with our own CopyDone and
+            // report a clean end of stream, rather than spinning over the
+            // trailing CommandComplete/ReadyForQuery until the socket EOFs.
+            b'c' => {
+                let _ = write_copy_done(stream).await;
+                Ok(true)
+            }
+            b'C' | b'Z' => Ok(true), // CommandComplete, ReadyForQuery
+            _ => Ok(false),          // NoticeResponse, ParameterStatus, ...
         }
     }
 
@@ -388,10 +408,12 @@ impl WorkerState {
 
                 // If the payload is a pgoutput Begin/Commit message, emit only the boundary event.
                 if let Some(boundary_ev) = parse_pgoutput_boundary(&data)? {
+                    // Only a Commit ends a bounded replay. `Begin.final_lsn` is
+                    // already the transaction's commit LSN, so stopping there
+                    // would discard the entire transaction body still to come.
                     let reached_lsn = match boundary_ev {
-                        ReplicationEvent::Begin { final_lsn, .. } => final_lsn,
-                        ReplicationEvent::Commit { end_lsn, .. } => end_lsn,
-                        _ => wal_end, // should never happen if parser only returns Begin/Commit
+                        ReplicationEvent::Commit { end_lsn, .. } => Some(end_lsn),
+                        _ => None,
                     };
 
                     if self
@@ -402,7 +424,8 @@ impl WorkerState {
                     }
 
                     // Stop condition (prefer boundary LSN semantics when available)
-                    if let Some(stop_lsn) = self.cfg.stop_at_lsn {
+                    if let (Some(stop_lsn), Some(reached_lsn)) = (self.cfg.stop_at_lsn, reached_lsn)
+                    {
                         if reached_lsn >= stop_lsn {
                             if self
                                 .send_event_backpressured(
@@ -686,6 +709,15 @@ impl WorkerState {
     }
 }
 
+/// Quote a SQL identifier for interpolation into a replication command.
+///
+/// Slot names reach the wire inside `START_REPLICATION SLOT ...`. Unquoted,
+/// PostgreSQL down-cases them (so a slot named `MySlot` is never found) and a
+/// name containing spaces or quotes could break out of the command.
+fn quote_ident(ident: &str) -> String {
+    format!("\"{}\"", ident.replace('"', "\"\""))
+}
+
 /// Parse SASL mechanism list from auth data.
 fn parse_sasl_mechanisms(data: &[u8]) -> Vec<String> {
     let mut mechanisms = Vec::new();
@@ -911,6 +943,25 @@ mod tests {
         frame
     }
 
+    /// pgoutput Begin: 'B' + final_lsn(8) + commit_time(8) + xid(4).
+    /// `final_lsn` is the transaction's *commit* LSN.
+    fn begin_payload(final_lsn: u64) -> Vec<u8> {
+        let mut v = vec![b'B'];
+        v.extend_from_slice(&(final_lsn as i64).to_be_bytes());
+        v.extend_from_slice(&0i64.to_be_bytes()); // commit_time
+        v.extend_from_slice(&7i32.to_be_bytes()); // xid
+        v
+    }
+
+    /// pgoutput Commit: 'C' + flags(1) + commit_lsn(8) + end_lsn(8) + ts(8).
+    fn commit_payload(end_lsn: u64) -> Vec<u8> {
+        let mut v = vec![b'C', 0];
+        v.extend_from_slice(&(end_lsn as i64).to_be_bytes()); // commit_lsn
+        v.extend_from_slice(&(end_lsn as i64).to_be_bytes()); // end_lsn
+        v.extend_from_slice(&0i64.to_be_bytes()); // commit_time
+        v
+    }
+
     /// Build a `WorkerState` wired to in-memory channels for unit testing.
     /// Returns the worker plus the stop sender and event receiver (held so the
     /// channels stay open for the duration of the test).
@@ -946,6 +997,119 @@ mod tests {
         )
         .await;
         assert!(matches!(res, Ok(Ok(()))), "expected Ok on 'W', got {res:?}");
+
+        // The slot name must reach the wire as a quoted identifier, so mixed-case
+        // names survive and quotes cannot break out of the command.
+        let query = MessageReader::new().read(&mut server).await.unwrap();
+        assert_eq!(query.tag, b'Q');
+        let sql = String::from_utf8_lossy(&query.payload);
+        assert!(sql.contains("SLOT \"slot\""), "slot must be quoted: {sql}");
+    }
+
+    #[test]
+    fn quote_ident_quotes_and_escapes() {
+        assert_eq!(quote_ident("my_slot"), "\"my_slot\"");
+        // Unquoted, PostgreSQL would down-case this and never find the slot.
+        assert_eq!(quote_ident("MySlot"), "\"MySlot\"");
+        // An embedded quote is doubled so it cannot terminate the identifier.
+        assert_eq!(quote_ident("a\"b"), "\"a\"\"b\"");
+    }
+
+    /// A server-initiated CopyDone ends the stream cleanly. Before this was
+    /// handled, 'c' (and the trailing CommandComplete/ReadyForQuery) fell
+    /// through the dispatch and the caller saw an `UnexpectedEof` error
+    /// instead of a normal end of stream.
+    #[tokio::test]
+    async fn server_copy_done_ends_stream_cleanly() {
+        use std::time::Duration;
+        use tokio::io::AsyncWriteExt;
+
+        let (mut worker, _stop_tx, _rx) = test_worker(ReplicationConfig::default());
+        let (worker_end, mut test_end) = tokio::io::duplex(64 * 1024);
+
+        // CopyDone: 'c' with a bare length field, no payload.
+        test_end.write_all(&[b'c', 0, 0, 0, 4]).await.unwrap();
+        test_end.flush().await.unwrap();
+
+        let res = tokio::time::timeout(Duration::from_secs(5), async move {
+            let mut buf = BufReader::with_capacity(1024, worker_end);
+            worker.stream_loop(&mut buf).await
+        })
+        .await;
+
+        assert!(
+            matches!(res, Ok(Ok(()))),
+            "expected clean end on server CopyDone, got {res:?}"
+        );
+    }
+
+    /// Bounded replay must deliver the whole transaction that crosses
+    /// `stop_at_lsn`. `Begin.final_lsn` is already the commit LSN, so checking
+    /// the stop condition there used to terminate the stream before any of the
+    /// transaction's changes were forwarded.
+    #[tokio::test]
+    async fn stop_at_lsn_delivers_the_boundary_transaction_before_stopping() {
+        use std::time::Duration;
+        use tokio::io::AsyncWriteExt;
+
+        let cfg = ReplicationConfig {
+            stop_at_lsn: Some(Lsn(50)),
+            ..Default::default()
+        };
+        let (mut worker, _stop_tx, mut rx) = test_worker(cfg);
+        let (worker_end, mut test_end) = tokio::io::duplex(64 * 1024);
+
+        // One transaction committing at LSN 100, past the stop LSN of 50. The
+        // CopyData header carries wal_end 0, as walsender does for logical
+        // replication on every write but the last of a record.
+        for payload in [
+            begin_payload(100),
+            b"Isome-insert".to_vec(),
+            commit_payload(100),
+        ] {
+            test_end.write_all(&xlog_frame(0, &payload)).await.unwrap();
+        }
+        test_end.flush().await.unwrap();
+
+        let worker_task = tokio::spawn(async move {
+            let mut buf = BufReader::with_capacity(1024, worker_end);
+            worker.stream_loop(&mut buf).await
+        });
+
+        let mut events = Vec::new();
+        while events.len() < 4 {
+            match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+                Ok(Some(Ok(ev))) => events.push(ev),
+                other => panic!("expected 4 events, got {events:?} then {other:?}"),
+            }
+        }
+
+        assert!(
+            matches!(events[0], ReplicationEvent::Begin { final_lsn, .. } if final_lsn == Lsn(100)),
+            "expected Begin, got {:?}",
+            events[0]
+        );
+        assert!(
+            matches!(&events[1], ReplicationEvent::XLogData { data, .. } if &data[..] == b"Isome-insert"),
+            "the transaction body must still be delivered, got {:?}",
+            events[1]
+        );
+        assert!(
+            matches!(events[2], ReplicationEvent::Commit { end_lsn, .. } if end_lsn == Lsn(100)),
+            "expected Commit, got {:?}",
+            events[2]
+        );
+        assert!(
+            matches!(events[3], ReplicationEvent::StoppedAt { reached } if reached == Lsn(100)),
+            "expected StoppedAt after the commit, got {:?}",
+            events[3]
+        );
+
+        let res = tokio::time::timeout(Duration::from_secs(5), worker_task).await;
+        assert!(
+            matches!(res, Ok(Ok(Ok(())))),
+            "expected clean exit: {res:?}"
+        );
     }
 
     #[tokio::test]

@@ -43,11 +43,12 @@ use super::worker::{ReplicationEvent, ReplicationEventReceiver, SharedProgress, 
 ///
 ///     while let Some(ev) = client.recv().await? {
 ///         match ev {
-///             ReplicationEvent::XLogData { data, wal_end, .. } => {
-///                 process_change(&data);
-///                 client.update_applied_lsn(wal_end);
-///             }
-///             ReplicationEvent::KeepAlive { .. } => {}
+///             ReplicationEvent::XLogData { data, .. } => process_change(&data),
+///             // Confirm at the commit boundary, once the transaction is durable.
+///             ReplicationEvent::Commit { end_lsn, .. } => client.update_applied_lsn(end_lsn),
+///             // Confirm the server's real WAL end so the slot advances while
+///             // this publication is idle but the database is not.
+///             ReplicationEvent::KeepAlive { wal_end, .. } => client.update_applied_lsn(wal_end),
 ///             ReplicationEvent::StoppedAt { reached } => {
 ///                 println!("Reached stop LSN: {reached}");
 ///                 break;
@@ -159,6 +160,12 @@ impl ReplicationClient {
     /// Semantics: call this only once you have durably persisted all events up to `lsn`.
     /// This update is monotonic and cheap; wire feedback is still governed by the worker’s
     /// `status_interval` and keepalive reply requests.
+    ///
+    /// Report [`Commit::end_lsn`](ReplicationEvent::Commit) and
+    /// [`KeepAlive::wal_end`](ReplicationEvent::KeepAlive). Do **not** rely on
+    /// [`XLogData::wal_end`](ReplicationEvent::XLogData): for logical replication that
+    /// field is the individual change's LSN, not the server's WAL end, so it never
+    /// advances the slot past a commit or during publication idle time.
     #[inline]
     pub fn update_applied_lsn(&self, lsn: Lsn) {
         self.progress.update_applied(lsn);

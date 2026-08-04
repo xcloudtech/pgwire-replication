@@ -51,7 +51,7 @@ pub async fn main() -> anyhow::Result<()> {
     loop {
         match repl.recv().await {
             Ok(Some(ev)) => match ev {
-                ReplicationEvent::KeepAlive { .. } => {}
+                ReplicationEvent::KeepAlive { wal_end, .. } => repl.update_applied_lsn(wal_end),
                 ReplicationEvent::XLogData {
                     wal_start,
                     wal_end,
@@ -62,7 +62,6 @@ pub async fn main() -> anyhow::Result<()> {
                         "XLogData wal_start={wal_start} wal_end={wal_end} bytes={}",
                         data.len()
                     );
-                    repl.update_applied_lsn(wal_end);
                 }
                 ReplicationEvent::StoppedAt { reached } => {
                     println!("StoppedAt reached={reached}");
@@ -73,9 +72,10 @@ pub async fn main() -> anyhow::Result<()> {
                     xid,
                     commit_time_micros,
                 } => println!("Transaction started, final_lsn={final_lsn}, xid={xid}, commit_t={commit_time_micros}"),
-                ReplicationEvent::Commit {
-                    ..
-                } => print!("transaction commit."),
+                ReplicationEvent::Commit { end_lsn, .. } => {
+                    println!("transaction commit, end_lsn={end_lsn}");
+                    repl.update_applied_lsn(end_lsn);
+                }
                 ReplicationEvent::Message { prefix, content, .. } => println!(
                     "Logical message: prefix={}, {} bytes", prefix, content.len()
                 ),
