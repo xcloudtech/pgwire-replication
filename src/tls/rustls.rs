@@ -168,10 +168,6 @@ pub async fn maybe_upgrade_to_tls(
         SslMode::Prefer | SslMode::Require | SslMode::VerifyCa | SslMode::VerifyFull => {}
     }
 
-    // Install crypto provider (required for rustls 0.23+)
-    // This is idempotent - safe to call multiple times
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
     // PostgreSQL TLS negotiation: send SSLRequest, expect 'S' or 'N'
     write_ssl_request(&mut tcp).await?;
 
@@ -240,7 +236,12 @@ fn build_rustls_config(
     let roots_arc = Arc::new(roots.clone());
 
     // ---- Base config builder ----
-    let builder = ClientConfig::builder().with_root_certificates(roots);
+    // The provider is passed in, so this works whatever the process has
+    // installed, and never installs one for the caller.
+    let builder = ClientConfig::builder_with_provider(crypto_provider())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| PgWireError::Tls(format!("TLS config error: protocol versions: {e}")))?
+        .with_root_certificates(roots);
 
     // ---- Client authentication (mTLS) ----
     let mut cfg: ClientConfig = if has_cert {
@@ -269,7 +270,7 @@ fn build_rustls_config(
 
     if verify_chain && !verify_hostname {
         // VerifyCa: verify certificate chain but ignore hostname mismatch
-        let inner = rustls::client::WebPkiServerVerifier::builder(roots_arc)
+        let inner = rustls::client::WebPkiServerVerifier::builder_with_provider(roots_arc, crypto_provider())
             .build()
             .map_err(|e| PgWireError::Tls(format!("TLS config error: build verifier: {e}")))?;
 
@@ -279,6 +280,25 @@ fn build_rustls_config(
 
     // VerifyFull: rustls default behavior already verifies chain + hostname
     Ok(cfg)
+}
+
+/// The one crypto provider this crate uses: aws-lc-rs.
+fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
+    Arc::new(rustls::crypto::aws_lc_rs::default_provider())
+}
+
+/// Is this the verifier's answer for a certificate that doesn't name the host?
+///
+/// Current rustls reports a name mismatch as `NotValidForNameContext`, and
+/// older releases as `NotValidForName`. verify-ca must forgive both.
+fn is_name_mismatch(err: &rustls::Error) -> bool {
+    matches!(
+        err,
+        rustls::Error::InvalidCertificate(
+            rustls::CertificateError::NotValidForName
+                | rustls::CertificateError::NotValidForNameContext { .. }
+        )
+    )
 }
 
 /// Build root certificate store from config or system defaults.
@@ -450,7 +470,7 @@ impl rustls::client::danger::ServerCertVerifier for VerifyChainOnly {
         {
             Ok(ok) => Ok(ok),
             // VerifyCa: ignore hostname mismatch but enforce chain validation
-            Err(rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidForName)) => {
+            Err(e) if is_name_mismatch(&e) => {
                 Ok(rustls::client::danger::ServerCertVerified::assertion())
             }
             Err(e) => Err(e),
@@ -571,5 +591,74 @@ mod tests {
         // Should fail gracefully, not panic
         assert!(load_private_key(f.path()).is_err());
         assert!(load_cert_chain(f.path()).is_err());
+    }
+
+    // ==================== verify-ca ignores the host name ====================
+    //
+    // The fixtures are a test CA and a leaf it signed for `db.internal` only,
+    // valid for 100 years.
+
+    fn fixture(name: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name)
+    }
+
+    fn leaf() -> rustls::pki_types::CertificateDer<'static> {
+        use rustls::pki_types::pem::PemObject;
+        rustls::pki_types::CertificateDer::from_pem_file(fixture("verify_ca_leaf.pem")).unwrap()
+    }
+
+    fn webpki(ca: &str) -> Arc<rustls::client::WebPkiServerVerifier> {
+        let tls = TlsConfig::verify_ca(Some(fixture(ca)));
+        let roots = Arc::new(build_root_store(&tls).unwrap());
+        rustls::client::WebPkiServerVerifier::builder_with_provider(roots, crypto_provider())
+            .build()
+            .unwrap()
+    }
+
+    fn verify(
+        verifier: &dyn rustls::client::danger::ServerCertVerifier,
+        name: &str,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let name = rustls::pki_types::ServerName::try_from(name.to_string()).unwrap();
+        verifier.verify_server_cert(&leaf(), &[], &name, &[], rustls::pki_types::UnixTime::now())
+    }
+
+    #[test]
+    fn verify_ca_accepts_a_dns_name_the_cert_does_not_carry() {
+        let verifier = VerifyChainOnly { inner: webpki("verify_ca_root.pem") };
+        verify(&verifier, "other.internal").expect("verify-ca ignores the host name");
+    }
+
+    #[test]
+    fn verify_ca_accepts_an_ip_address() {
+        let verifier = VerifyChainOnly { inner: webpki("verify_ca_root.pem") };
+        verify(&verifier, "10.0.0.5").expect("verify-ca ignores the host name");
+    }
+
+    #[test]
+    fn verify_ca_still_refuses_an_untrusted_chain() {
+        let verifier = VerifyChainOnly { inner: webpki("test_cert.pem") };
+        let err = verify(&verifier, "db.internal").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer)
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_full_refuses_a_name_the_cert_does_not_carry() {
+        let err = verify(webpki("verify_ca_root.pem").as_ref(), "other.internal").unwrap_err();
+        assert!(is_name_mismatch(&err), "{err:?}");
+    }
+
+    #[test]
+    fn verify_ca_config_builds_without_a_process_default_provider() {
+        let tls = TlsConfig::verify_ca(Some(fixture("verify_ca_root.pem")));
+        build_rustls_config(&tls, true, false, "10.0.0.5").expect("config builds");
     }
 }

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Fixed
+- **`verify-ca` no longer checks the host name.** Current rustls reports a name mismatch as `NotValidForNameContext`, which the chain-only verifier did not forgive, so `verify-ca` behaved like `verify-full`. A server reached by IP address with a CA-signed certificate now connects under `verify-ca`, as libpq allows. The chain is still verified.
+
+### Changed
+- **The `tls-rustls` feature uses aws-lc-rs only.** `ring` is no longer compiled in. The TLS config is built with that provider passed explicitly, so the crate no longer installs a process-wide default rustls provider, and works whatever provider the application installs.
+
+---
+
 ## [0.4.0] - 2026-07-14
 
 ### Added
