@@ -49,14 +49,20 @@
 //!     while let Some(event) = client.recv().await? {
 //!         match event {
 //!             ReplicationEvent::XLogData { data, wal_end, .. } => {
-//!                 // Parse and process pgoutput data
+//!                 // Parse and process pgoutput data. Don't report this
+//!                 // `wal_end`: for logical replication it is the change's own
+//!                 // LSN, and confirming it can't move the slot past a commit.
 //!                 println!("Received {} bytes at {}", data.len(), wal_end);
-//!
-//!                 // Report progress to allow WAL cleanup
-//!                 client.update_applied_lsn(wal_end);
+//!             }
+//!             ReplicationEvent::Commit { end_lsn, .. } => {
+//!                 // The transaction is done: report its end to allow WAL cleanup.
+//!                 client.update_applied_lsn(end_lsn);
 //!             }
 //!             ReplicationEvent::KeepAlive { wal_end, .. } => {
+//!                 // The server's real WAL end. Confirming it releases WAL
+//!                 // while the publication is idle.
 //!                 println!("Server heartbeat at {}", wal_end);
+//!                 client.update_applied_lsn(wal_end);
 //!             }
 //!             ReplicationEvent::StoppedAt { reached } => {
 //!                 println!("Reached stop LSN {}", reached);
