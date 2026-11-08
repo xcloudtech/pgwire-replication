@@ -357,6 +357,16 @@ pub struct ReplicationConfig {
     /// - Specific LSN: Resume from that position (must be >= slot's restart_lsn)
     pub start_lsn: Lsn,
 
+    /// LSN reported to the server as flushed and applied until the consumer
+    /// reports more through `update_applied_lsn`.
+    ///
+    /// - `None` (default): `start_lsn`.
+    /// - `Some(lsn)`: report `lsn` instead. A consumer that resumes reading
+    ///   from a position it has not made durable sets this to its durable
+    ///   position, so the slot's `confirmed_flush_lsn` never advances past
+    ///   what the consumer could recover from after a crash.
+    pub ack_lsn: Option<Lsn>,
+
     /// Optional LSN to stop replication at.
     ///
     /// When set, replication will stop once a commit with `end_lsn >= stop_at_lsn`
@@ -378,7 +388,7 @@ pub struct ReplicationConfig {
     /// allowing the server to release WAL segments. Too infrequent updates
     /// may cause WAL accumulation; too frequent updates add overhead.
     ///
-    /// Default: 10 seconds
+    /// Default: 10 seconds (`pg_recvlogical` defaults to 10 seconds too)
     pub status_interval: Duration,
 
     /// Maximum time to wait for server messages before waking up.
@@ -386,6 +396,9 @@ pub struct ReplicationConfig {
     /// Silence is normal during logical replication. When this interval elapses
     /// with no incoming messages, the client will send a standby status update
     /// (feedback) and continue waiting.
+    ///
+    /// A raised applied LSN does not wait for this wakeup: it is sent within
+    /// `status_interval` of `update_applied_lsn`.
     ///
     /// This effectively bounds how long the worker can stay blocked in a read
     /// while idle.
@@ -419,6 +432,67 @@ pub struct ReplicationConfig {
     ///
     /// Default: `false`
     pub binary: bool,
+
+    /// Value for the startup `options` parameter, passed through to the
+    /// server the same way `libpq`'s `options` connection parameter (or the
+    /// `PGOPTIONS` environment variable) would on an ordinary connection.
+    ///
+    /// PostgreSQL honors `options` on replication connections too, so this
+    /// is typically used to pin session GUCs (e.g.
+    /// `"-c datestyle=ISO,MDY -c intervalstyle=iso_8601"`) so that values
+    /// decoded from the replication stream are rendered in text the same
+    /// way as values read through a regular connection whose GUCs are also
+    /// pinned.
+    ///
+    /// See [`PGOPTIONS`](https://www.postgresql.org/docs/current/libpq-envars.html)
+    /// for the `-c name=value` syntax.
+    ///
+    /// Default: `None` (server defaults apply).
+    pub options: Option<String>,
+
+    /// Largest backend message **payload** accepted, in bytes.
+    ///
+    /// Measured as the message's length field minus 4, so it excludes the
+    /// 1-byte tag and the 4-byte length field: the bytes on the wire for a
+    /// message at the limit are `max_message_size + 5`.
+    ///
+    /// The worker sizes its buffer from the length the server announces, so
+    /// this bounds the memory **one message** can take. A message over the
+    /// limit is refused before any of it is buffered and ends the stream with
+    /// [`PgWireError::MessageTooLarge`](crate::error::PgWireError::MessageTooLarge).
+    /// The refused payload is never consumed, so the connection cannot be
+    /// resumed past it — the reader and connection must be discarded. The
+    /// same limit bounds each row of a gated session's
+    /// [`simple_query`](crate::ReplicationClient::simple_query).
+    ///
+    /// It bounds exactly one backend-message payload allocation. It does
+    /// **not** bound an entire transaction (whose changes span many
+    /// messages), the event channel or the decoded events buffered in
+    /// [`buffer_events`](Self::buffer_events), total process memory, or
+    /// aggregate memory across connections.
+    ///
+    /// As a matter of PostgreSQL framing, `pgoutput` writes each row change
+    /// as one `CopyData` message, so a single wide row or a large
+    /// `pg_logical_emit_message()` payload arrives as one message and must
+    /// fit under this limit. Set below that and the stream ends on the first
+    /// such row. That is a statement about framing, not a memory guarantee.
+    ///
+    /// Default: [`MAX_MESSAGE_SIZE`](crate::protocol::framing::MAX_MESSAGE_SIZE) (1 GiB)
+    pub max_message_size: usize,
+
+    /// `application_name` sent in the startup message, shown in
+    /// `pg_stat_activity` and `pg_stat_replication`. A consumer that must
+    /// tell its own walsender from other sessions sets a unique value.
+    ///
+    /// Default: `None` (`pgwire-replication`).
+    pub application_name: Option<String>,
+
+    /// Called after each successful standby status update that advanced the
+    /// position reported to the server, with how long that position waited
+    /// ([`FeedbackSent`](crate::FeedbackSent)). Without one, no timing is kept.
+    ///
+    /// Default: `None`
+    pub feedback_observer: Option<crate::FeedbackObserver>,
 }
 
 impl Default for ReplicationConfig {
@@ -433,11 +507,16 @@ impl Default for ReplicationConfig {
             slot: "slot".into(),
             publication: "pub".into(),
             start_lsn: Lsn(0),
+            ack_lsn: None,
             stop_at_lsn: None,
             status_interval: Duration::from_secs(10),
             idle_wakeup_interval: Duration::from_secs(10),
             buffer_events: 8192,
             binary: false,
+            options: None,
+            max_message_size: crate::protocol::framing::MAX_MESSAGE_SIZE,
+            application_name: None,
+            feedback_observer: None,
         }
     }
 }
@@ -565,6 +644,13 @@ impl ReplicationConfig {
         self
     }
 
+    /// Report `lsn` as the initially applied position instead of the start
+    /// position (see [`ReplicationConfig::ack_lsn`]).
+    pub fn with_ack_lsn(mut self, lsn: Lsn) -> Self {
+        self.ack_lsn = Some(lsn);
+        self
+    }
+
     /// Set an optional stop LSN for bounded replay.
     pub fn with_stop_lsn(mut self, lsn: Lsn) -> Self {
         self.stop_at_lsn = Some(lsn);
@@ -594,6 +680,59 @@ impl ReplicationConfig {
     /// See [`binary`](Self::binary) for caveats — off by default.
     pub fn with_binary(mut self, binary: bool) -> Self {
         self.binary = binary;
+        self
+    }
+
+    /// Set the startup `options` parameter (equivalent to `libpq`'s `options`
+    /// connection parameter / `PGOPTIONS`).
+    ///
+    /// # Example
+    /// ```
+    /// use pgwire_replication::config::ReplicationConfig;
+    ///
+    /// let config = ReplicationConfig::new("h", "u", "p", "db", "slot", "pub")
+    ///     .with_options("-c datestyle=ISO,MDY -c intervalstyle=iso_8601");
+    /// assert_eq!(
+    ///     config.options.as_deref(),
+    ///     Some("-c datestyle=ISO,MDY -c intervalstyle=iso_8601")
+    /// );
+    /// ```
+    pub fn with_options(mut self, options: impl Into<String>) -> Self {
+        self.options = Some(options.into());
+        self
+    }
+
+    /// Set the largest backend message payload accepted, in bytes.
+    ///
+    /// See [`max_message_size`](Self::max_message_size) for what the bound
+    /// covers. This can only lower the limit: a value above
+    /// [`MAX_MESSAGE_SIZE`](crate::protocol::framing::MAX_MESSAGE_SIZE) is
+    /// capped to it.
+    ///
+    /// # Example
+    /// ```
+    /// use pgwire_replication::config::ReplicationConfig;
+    ///
+    /// let config = ReplicationConfig::new("localhost", "u", "p", "db", "slot", "pub")
+    ///     .with_max_message_size(64 * 1024 * 1024);
+    /// assert_eq!(config.max_message_size, 64 * 1024 * 1024);
+    /// ```
+    pub fn with_max_message_size(mut self, bytes: usize) -> Self {
+        self.max_message_size = bytes.min(crate::protocol::framing::MAX_MESSAGE_SIZE);
+        self
+    }
+
+    /// Set the startup `application_name` (see
+    /// [`ReplicationConfig::application_name`]).
+    pub fn with_application_name(mut self, name: impl Into<String>) -> Self {
+        self.application_name = Some(name.into());
+        self
+    }
+
+    /// Observe successful standby status updates that advanced the reported
+    /// position (see [`feedback_observer`](Self::feedback_observer)).
+    pub fn with_feedback_observer(mut self, observer: crate::FeedbackObserver) -> Self {
+        self.feedback_observer = Some(observer);
         self
     }
 
@@ -722,6 +861,35 @@ mod tests {
         assert!(!ReplicationConfig::default().binary);
         let cfg = ReplicationConfig::new("h", "u", "p", "db", "slot", "pub").with_binary(true);
         assert!(cfg.binary);
+    }
+
+    #[test]
+    fn max_message_size_defaults_to_the_protocol_limit_and_builder_sets_it() {
+        assert_eq!(
+            ReplicationConfig::default().max_message_size,
+            crate::protocol::framing::MAX_MESSAGE_SIZE
+        );
+        let cfg =
+            ReplicationConfig::new("h", "u", "p", "db", "slot", "pub").with_max_message_size(1024);
+        assert_eq!(cfg.max_message_size, 1024);
+    }
+
+    #[test]
+    fn max_message_size_cannot_be_raised_above_the_protocol_limit() {
+        let cfg = ReplicationConfig::new("h", "u", "p", "db", "slot", "pub")
+            .with_max_message_size(usize::MAX);
+        assert_eq!(
+            cfg.max_message_size,
+            crate::protocol::framing::MAX_MESSAGE_SIZE
+        );
+    }
+
+    #[test]
+    fn options_defaults_none_and_builder_sets_it() {
+        assert_eq!(ReplicationConfig::default().options, None);
+        let cfg = ReplicationConfig::new("h", "u", "p", "db", "slot", "pub")
+            .with_options("-c datestyle=ISO,MDY");
+        assert_eq!(cfg.options.as_deref(), Some("-c datestyle=ISO,MDY"));
     }
 
     #[test]

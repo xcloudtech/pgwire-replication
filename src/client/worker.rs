@@ -1,11 +1,11 @@
 use bytes::Bytes;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
 use super::metrics::ReplicationMetrics;
+use super::progress::ProgressCell;
 use crate::config::ReplicationConfig;
 use crate::error::{PgWireError, Result};
 use crate::lsn::Lsn;
@@ -20,40 +20,90 @@ use crate::protocol::replication::{
 
 /// Shared replication progress updated by the consumer and read by the worker.
 ///
-/// Stored as an AtomicU64 so progress updates are cheap and monotonic
-/// without async backpressure.
+/// The applied LSN lives in a lock-free [`ProgressCell`] so progress updates
+/// are cheap and monotonic without async backpressure. A raise also wakes an
+/// idle worker, which sends it promptly instead of at its next wakeup. Only the
+/// first raise after the worker last looked bumps the watch generation; later
+/// ones coalesce into it and cost one more atomic load.
 pub struct SharedProgress {
-    applied: AtomicU64,
+    cell: ProgressCell,
+    changed: watch::Sender<u64>,
+}
+
+/// Clock origin for pending starts (nanoseconds after it, plus one), shared
+/// by every session so a start carried from an earlier one stays comparable.
+/// tokio's clock: the system clock, paused under test. Set an hour back so a
+/// clock read on another (paused) runtime never falls before it.
+fn clock_origin() -> Instant {
+    static ORIGIN: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    *ORIGIN.get_or_init(|| {
+        let now = Instant::now();
+        now.checked_sub(std::time::Duration::from_secs(3600))
+            .unwrap_or(now)
+    })
 }
 
 impl SharedProgress {
+    #[cfg(test)]
     pub fn new(start: Lsn) -> Self {
+        Self::with_timing(start, false)
+    }
+
+    /// `timed`: keep when the oldest unreported raise happened, for a
+    /// feedback observer.
+    pub fn with_timing(start: Lsn, timed: bool) -> Self {
         Self {
-            applied: AtomicU64::new(start.as_u64()),
+            cell: ProgressCell::new(start.as_u64(), timed),
+            changed: watch::Sender::new(0),
         }
+    }
+
+    fn clock(&self) -> u64 {
+        clock_origin().elapsed().as_nanos() as u64 + 1
+    }
+
+    fn instant(&self, clock: u64) -> Instant {
+        clock_origin() + std::time::Duration::from_nanos(clock - 1)
+    }
+
+    /// When the oldest raise not yet reported to the server happened.
+    pub fn pending_since(&self) -> Option<std::time::Instant> {
+        match self.cell.pending_since() {
+            0 => None,
+            clock => Some(self.instant(clock).into_std()),
+        }
+    }
+
+    /// Carry over the pending start of an earlier session (the older wins).
+    pub fn carry_pending(&self, since: std::time::Instant) {
+        let since = Instant::from_std(since);
+        let clock = since.saturating_duration_since(clock_origin()).as_nanos() as u64 + 1;
+        self.cell.carry_pending(clock);
     }
 
     #[inline]
     pub fn load_applied(&self) -> Lsn {
-        Lsn::from_u64(self.applied.load(Ordering::Acquire))
+        Lsn::from_u64(self.cell.load())
     }
 
     /// Monotonic update: if `lsn` is lower than the currently stored applied LSN,
     /// this is a no-op.
     #[inline]
     pub fn update_applied(&self, lsn: Lsn) {
-        let new = lsn.as_u64();
-        let mut cur = self.applied.load(Ordering::Relaxed);
-
-        while new > cur {
-            match self
-                .applied
-                .compare_exchange_weak(cur, new, Ordering::Release, Ordering::Relaxed)
-            {
-                Ok(_) => break,
-                Err(observed) => cur = observed,
-            }
+        if self.cell.raise(lsn.as_u64(), || self.clock()) {
+            self.changed.send_modify(|g| *g = g.wrapping_add(1));
         }
+    }
+
+    /// Wakes when the applied LSN is raised.
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.changed.subscribe()
+    }
+
+    /// The worker is about to read the applied LSN: the next raise wakes it
+    /// again. Returns the applied LSN read after clearing the signal.
+    fn take_signal(&self) -> Lsn {
+        Lsn::from_u64(self.cell.take_signal())
     }
 }
 
@@ -130,6 +180,23 @@ pub enum ReplicationEvent {
 pub type ReplicationEventReceiver =
     mpsc::Receiver<std::result::Result<ReplicationEvent, PgWireError>>;
 
+/// One row of a simple-query result: each column's text-format value, `None`
+/// for SQL NULL.
+pub type QueryRow = Vec<Option<Bytes>>;
+
+/// A request to a gated session, which waits after authentication instead of
+/// starting replication at once.
+pub(crate) enum GateCommand {
+    /// Run a simple query (SQL or a replication command such as
+    /// IDENTIFY_SYSTEM) on the authenticated session.
+    Query {
+        sql: String,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<QueryRow>>>,
+    },
+    /// Send START_REPLICATION.
+    Start,
+}
+
 /// Internal worker state.
 pub struct WorkerState {
     cfg: ReplicationConfig,
@@ -137,6 +204,13 @@ pub struct WorkerState {
     stop_rx: watch::Receiver<bool>,
     out: mpsc::Sender<std::result::Result<ReplicationEvent, PgWireError>>,
     metrics: Arc<ReplicationMetrics>,
+    /// Set to `true` once the server accepted START_REPLICATION.
+    started: Option<watch::Sender<bool>>,
+    /// When set, the session waits for these commands between authentication
+    /// and START_REPLICATION.
+    gate: Option<mpsc::Receiver<GateCommand>>,
+    /// The applied LSN in the last status update written to the server, if any.
+    last_sent: Option<Lsn>,
 }
 
 impl WorkerState {
@@ -153,6 +227,51 @@ impl WorkerState {
             stop_rx,
             out,
             metrics,
+            started: None,
+            gate: None,
+            last_sent: None,
+        }
+    }
+
+    /// Notify `started` once the server accepts START_REPLICATION.
+    pub(crate) fn notify_started(&mut self, started: watch::Sender<bool>) {
+        self.started = Some(started);
+    }
+
+    /// Wait for `gate` commands after authentication, before START_REPLICATION:
+    /// queries run on the authenticated session, `Start` starts replication,
+    /// and a closed gate ends the session without starting.
+    pub(crate) fn gate_before_start(&mut self, gate: mpsc::Receiver<GateCommand>) {
+        self.gate = Some(gate);
+    }
+
+    /// Serve gate commands until `Start`. `false`: the gate closed (the client
+    /// was dropped) and the session ended without starting.
+    async fn serve_gate<S: AsyncRead + AsyncWrite + Unpin>(
+        gate: &mut mpsc::Receiver<GateCommand>,
+        stream: &mut S,
+        max_message_size: usize,
+    ) -> Result<bool> {
+        loop {
+            match gate.recv().await {
+                Some(GateCommand::Query { sql, reply }) => {
+                    let result = simple_query(stream, &sql, max_message_size).await;
+                    // A server error leaves the session usable (it ends with
+                    // ReadyForQuery); anything else leaves the stream in an
+                    // unknown state, so the session ends.
+                    let broken = matches!(&result, Err(e) if !e.is_server());
+                    let ended = result.as_ref().err().cloned();
+                    let _ = reply.send(result);
+                    if broken {
+                        return Err(ended.expect("checked error"));
+                    }
+                }
+                Some(GateCommand::Start) => return Ok(true),
+                None => {
+                    write_terminate(stream).await?;
+                    return Ok(false);
+                }
+            }
         }
     }
 
@@ -167,19 +286,40 @@ impl WorkerState {
         let mut stream = BufReader::with_capacity(128 * 1024, stream);
         self.startup(&mut stream).await?;
         self.authenticate(&mut stream).await?;
+        if let Some(mut gate) = self.gate.take() {
+            if !Self::serve_gate(&mut gate, &mut stream, self.cfg.max_message_size).await? {
+                return Ok(());
+            }
+        }
         self.start_replication(&mut stream).await?;
+        if let Some(started) = &self.started {
+            started.send_replace(true);
+        }
         self.stream_loop(&mut stream).await
     }
 
     /// Send startup message with replication parameters.
     async fn startup<S: AsyncWrite + Unpin>(&self, stream: &mut S) -> Result<()> {
-        let params = [
+        let mut params = vec![
             ("user", self.cfg.user.as_str()),
             ("database", self.cfg.database.as_str()),
             ("replication", "database"),
             ("client_encoding", "UTF8"),
-            ("application_name", "pgwire-replication"),
+            (
+                "application_name",
+                self.cfg
+                    .application_name
+                    .as_deref()
+                    .unwrap_or("pgwire-replication"),
+            ),
         ];
+        // PostgreSQL honors `options` on replication connections the same as on
+        // ordinary ones, so this lets callers pin session GUCs (e.g. `DateStyle`,
+        // `IntervalStyle`) the way they already can via a normal libpq `options`
+        // parameter — only sent when the caller actually set one.
+        if let Some(options) = self.cfg.options.as_deref() {
+            params.push(("options", options));
+        }
         write_startup_message(stream, 196608, &params).await
     }
 
@@ -237,8 +377,10 @@ impl WorkerState {
     ) -> Result<()> {
         let mut last_status_sent = Instant::now() - self.cfg.status_interval;
         let mut last_applied = self.progress.load_applied();
+        // Wakes the wait phase when the consumer raises the applied LSN.
+        let mut applied_rx = self.progress.subscribe();
         // Cancellation-safe message reader, partial reads survive dropped futures.
-        let mut reader = MessageReader::new();
+        let mut reader = MessageReader::new().with_max_message_size(self.cfg.max_message_size);
         // How many messages to process in the tight loop before checking
         // stop signal and sending periodic status feedback.
         const DRAIN_BATCH: usize = 256;
@@ -289,6 +431,16 @@ impl WorkerState {
             // mid-message. `MessageReader::read` is cancellation-safe — partial
             // header/payload state lives on `reader` and is preserved across the
             // drop, so the next iteration resumes the read without losing bytes.
+            //
+            // An applied LSN newer than the last one sent is pending: it is sent
+            // once `status_interval` has passed since the last status update.
+            // Otherwise a raise wakes the loop. Marking the watch seen and
+            // clearing the signal before reading the LSN means a raise after
+            // this point still wakes it.
+            applied_rx.mark_unchanged();
+            let applied = self.progress.take_signal();
+            let pending = self.last_sent.is_none_or(|sent| applied > sent);
+            let feedback_due = last_status_sent + self.cfg.status_interval;
             let msg = tokio::select! {
                 biased;
 
@@ -299,6 +451,17 @@ impl WorkerState {
                     }
                     continue;
                 }
+
+                _ = tokio::time::sleep_until(feedback_due), if pending => {
+                    let applied = self.progress.load_applied();
+                    last_applied = applied;
+                    self.send_feedback(stream, applied, false).await?;
+                    last_status_sent = Instant::now();
+                    continue;
+                }
+
+                // The sender lives in `self.progress`, so this never closes.
+                _ = applied_rx.changed(), if !pending => continue,
 
                 msg_result = tokio::time::timeout(
                     self.cfg.idle_wakeup_interval,
@@ -556,6 +719,7 @@ impl WorkerState {
                         let _ = write_copy_done(stream).await;
                         return Ok(true);
                     }
+                    continue;
                 }
 
                 permit = self.out.reserve() => {
@@ -573,12 +737,12 @@ impl WorkerState {
                     return Ok(false);
                 }
 
-                _ = tokio::time::sleep_until(deadline) => {
-                    let applied = self.progress.load_applied();
-                    self.send_feedback(stream, applied, false).await?;
-                    *last_status_sent = Instant::now();
-                }
+                _ = tokio::time::sleep_until(deadline) => {}
             }
+            // The status interval elapsed while parked.
+            let applied = self.progress.load_applied();
+            self.send_feedback(stream, applied, false).await?;
+            *last_status_sent = Instant::now();
         }
     }
 
@@ -695,16 +859,33 @@ impl WorkerState {
     }
 
     /// Send standby status update to server.
+    ///
+    /// The position is recorded as sent only once the write succeeded, so a
+    /// failed send leaves it pending.
     async fn send_feedback<S: AsyncWrite + Unpin>(
-        &self,
+        &mut self,
         stream: &mut S,
         applied: Lsn,
         reply_requested: bool,
     ) -> Result<()> {
+        // Timed only when this write advances the reported position and
+        // someone observes it.
+        let loaded_at = (self.cfg.feedback_observer.is_some()
+            && self.last_sent.is_none_or(|sent| applied > sent))
+        .then(|| self.progress.clock());
         let client_time = current_pg_timestamp();
         let payload = encode_standby_status_update(applied, client_time, reply_requested);
         write_copy_data(stream, &payload).await?;
+        self.last_sent = Some(applied);
         self.metrics.record_feedback_sent(applied);
+        if let (Some(at), Some(observer)) = (loaded_at, &self.cfg.feedback_observer) {
+            let since = self.progress.cell.take_pending(applied.as_u64(), at);
+            if since != 0 {
+                observer.observe(crate::FeedbackSent {
+                    pending_for: self.progress.instant(since).elapsed(),
+                });
+            }
+        }
         Ok(())
     }
 }
@@ -716,6 +897,71 @@ impl WorkerState {
 /// name containing spaces or quotes could break out of the command.
 fn quote_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
+}
+
+/// Run `sql` with the simple query protocol and collect its rows (text
+/// format). A server ErrorResponse is returned once the server is ready for
+/// the next query.
+async fn simple_query<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    sql: &str,
+    max_message_size: usize,
+) -> Result<Vec<QueryRow>> {
+    write_query(stream, sql).await?;
+    // Rows can be as large as the query makes them: bound them like the
+    // replication stream. A refused message is terminal (the session ends).
+    let mut reader = MessageReader::new().with_max_message_size(max_message_size);
+    let mut rows = Vec::new();
+    let mut error = None;
+    loop {
+        let msg = reader.read(stream).await?;
+        match msg.tag {
+            b'D' => rows.push(parse_data_row(&msg.payload)?),
+            b'E' => error = Some(PgWireError::Server(parse_error_response(&msg.payload))),
+            b'Z' => return error.map_or(Ok(rows), Err),
+            // RowDescription, CommandComplete, EmptyQueryResponse, notices,
+            // parameter status.
+            _ => continue,
+        }
+    }
+}
+
+/// Parse a DataRow ('D') payload.
+fn parse_data_row(payload: &Bytes) -> Result<QueryRow> {
+    let malformed = || PgWireError::Protocol("malformed DataRow".into());
+    let mut p = payload.clone();
+    if p.len() < 2 {
+        return Err(malformed());
+    }
+    let columns = i16::from_be_bytes([p[0], p[1]]);
+    p = p.slice(2..);
+    let mut row = Vec::with_capacity(columns.max(0) as usize);
+    for _ in 0..columns {
+        if p.len() < 4 {
+            return Err(malformed());
+        }
+        let len = i32::from_be_bytes([p[0], p[1], p[2], p[3]]);
+        p = p.slice(4..);
+        if len < 0 {
+            row.push(None);
+            continue;
+        }
+        let len = len as usize;
+        if p.len() < len {
+            return Err(malformed());
+        }
+        row.push(Some(p.slice(..len)));
+        p = p.slice(len..);
+    }
+    Ok(row)
+}
+
+/// Send Terminate ('X') to end the session.
+async fn write_terminate<S: AsyncWrite + Unpin>(stream: &mut S) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    stream.write_all(&[b'X', 0, 0, 0, 4]).await?;
+    stream.flush().await?;
+    Ok(())
 }
 
 /// Parse SASL mechanism list from auth data.
@@ -972,12 +1218,342 @@ mod tests {
         watch::Sender<bool>,
         mpsc::Receiver<std::result::Result<ReplicationEvent, PgWireError>>,
     ) {
-        let progress = Arc::new(SharedProgress::new(cfg.start_lsn));
+        let progress = Arc::new(SharedProgress::new(cfg.ack_lsn.unwrap_or(cfg.start_lsn)));
         let (stop_tx, stop_rx) = watch::channel(false);
         let (tx, rx) = mpsc::channel(16);
         let metrics = Arc::new(ReplicationMetrics::default());
         let worker = WorkerState::new(cfg, progress, stop_rx, tx, metrics);
         (worker, stop_tx, rx)
+    }
+
+    /// The `options` startup parameter is how `libpq`/`PGOPTIONS` lets a caller
+    /// pin session GUCs (e.g. `DateStyle`, `IntervalStyle`) on a connection.
+    /// PostgreSQL honors it on replication connections too, so it must be
+    /// forwarded into the startup message when the caller sets it, and left
+    /// out entirely otherwise (server defaults apply).
+    #[tokio::test]
+    async fn startup_includes_options_when_set() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let cfg = ReplicationConfig::new("h", "u", "p", "db", "slot", "pub")
+            .with_options("-c datestyle=ISO,MDY -c intervalstyle=iso_8601");
+        let (worker, _stop_tx, _rx) = test_worker(cfg);
+        let (mut worker_end, mut server) = tokio::io::duplex(64 * 1024);
+
+        worker.startup(&mut worker_end).await.unwrap();
+        worker_end.shutdown().await.unwrap();
+
+        let mut sent = Vec::new();
+        server.read_to_end(&mut sent).await.unwrap();
+        let sent = String::from_utf8_lossy(&sent);
+
+        assert!(
+            sent.contains("options"),
+            "startup message missing 'options' key: {sent:?}"
+        );
+        assert!(
+            sent.contains("-c datestyle=ISO,MDY -c intervalstyle=iso_8601"),
+            "startup message missing options value: {sent:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_sends_the_application_name() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for (cfg, expected) in [
+            (ReplicationConfig::default(), "pgwire-replication"),
+            (
+                ReplicationConfig::default().with_application_name("df-7f3a"),
+                "df-7f3a",
+            ),
+        ] {
+            let (worker, _stop_tx, _rx) = test_worker(cfg);
+            let (mut worker_end, mut server) = tokio::io::duplex(64 * 1024);
+            worker.startup(&mut worker_end).await.unwrap();
+            worker_end.shutdown().await.unwrap();
+            let mut sent = Vec::new();
+            server.read_to_end(&mut sent).await.unwrap();
+            let pair = format!("application_name\0{expected}\0");
+            assert!(
+                sent.windows(pair.len()).any(|w| w == pair.as_bytes()),
+                "startup message missing {pair:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_omits_options_when_unset() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (worker, _stop_tx, _rx) = test_worker(ReplicationConfig::default());
+        let (mut worker_end, mut server) = tokio::io::duplex(64 * 1024);
+
+        worker.startup(&mut worker_end).await.unwrap();
+        worker_end.shutdown().await.unwrap();
+
+        let mut sent = Vec::new();
+        server.read_to_end(&mut sent).await.unwrap();
+        let sent = String::from_utf8_lossy(&sent);
+
+        assert!(
+            !sent.contains("options"),
+            "startup message should omit 'options' when unset: {sent:?}"
+        );
+    }
+
+    /// The worker must build its reader from `cfg.max_message_size`. Without
+    /// that wiring an oversized frame is accepted and the limit is inert, so
+    /// this fails if `stream_loop` goes back to a default `MessageReader`.
+    #[tokio::test]
+    async fn stream_loop_refuses_a_frame_over_the_configured_limit() {
+        use tokio::io::AsyncWriteExt;
+
+        let cfg = ReplicationConfig {
+            max_message_size: 64,
+            ..Default::default()
+        };
+
+        let progress = Arc::new(SharedProgress::new(Lsn(0)));
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let (tx, mut rx) = mpsc::channel(16);
+        let metrics = Arc::new(ReplicationMetrics::default());
+        let mut worker = WorkerState::new(cfg, progress, stop_rx, tx, Arc::clone(&metrics));
+
+        let (worker_end, mut test_end) = tokio::io::duplex(64 * 1024);
+        let worker_task = tokio::spawn(async move {
+            let mut buf = BufReader::with_capacity(1024, worker_end);
+            worker.stream_loop(&mut buf).await
+        });
+
+        // One frame past the 64-byte limit, then a frame the worker would
+        // happily forward if it resynchronized past the refused one.
+        test_end
+            .write_all(&xlog_frame(1, &[b'x'; 200]))
+            .await
+            .unwrap();
+        test_end.write_all(&xlog_frame(2, b"Ismall")).await.unwrap();
+        test_end.flush().await.unwrap();
+
+        let err = tokio::time::timeout(std::time::Duration::from_secs(5), worker_task)
+            .await
+            .expect("stream_loop should end on the oversized frame")
+            .unwrap()
+            .expect_err("stream_loop should fail, not return Ok");
+
+        assert!(
+            matches!(
+                err,
+                PgWireError::MessageTooLarge {
+                    limit_bytes: 64,
+                    ..
+                }
+            ),
+            "expected MessageTooLarge, got {err:?}"
+        );
+        assert!(!err.is_transient());
+
+        // Neither the refused frame nor the one behind it reaches the consumer.
+        assert!(
+            rx.try_recv().is_err(),
+            "no event should be emitted for a refused frame"
+        );
+        // And nothing was acknowledged.
+        assert_eq!(metrics.last_applied_lsn(), Lsn(0));
+    }
+
+    /// A backend frame: tag, length, payload.
+    fn frame(tag: u8, payload: &[u8]) -> Vec<u8> {
+        let mut f = vec![tag];
+        f.extend_from_slice(&((payload.len() + 4) as i32).to_be_bytes());
+        f.extend_from_slice(payload);
+        f
+    }
+
+    fn data_row(cols: &[Option<&[u8]>]) -> Vec<u8> {
+        let mut p = (cols.len() as i16).to_be_bytes().to_vec();
+        for c in cols {
+            match c {
+                Some(v) => {
+                    p.extend_from_slice(&(v.len() as i32).to_be_bytes());
+                    p.extend_from_slice(v);
+                }
+                None => p.extend_from_slice(&(-1i32).to_be_bytes()),
+            }
+        }
+        frame(b'D', &p)
+    }
+
+    /// Read one frontend message (tag + payload) from the server side.
+    async fn read_frontend(server: &mut tokio::io::DuplexStream) -> (u8, Vec<u8>) {
+        use tokio::io::AsyncReadExt;
+        let tag = server.read_u8().await.unwrap();
+        let len = server.read_i32().await.unwrap() as usize;
+        let mut payload = vec![0; len - 4];
+        server.read_exact(&mut payload).await.unwrap();
+        (tag, payload)
+    }
+
+    async fn gated_query(
+        gate: &mpsc::Sender<GateCommand>,
+        sql: &str,
+    ) -> tokio::sync::oneshot::Receiver<Result<Vec<QueryRow>>> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        gate.send(GateCommand::Query {
+            sql: sql.into(),
+            reply,
+        })
+        .await
+        .unwrap();
+        rx
+    }
+
+    #[tokio::test]
+    async fn a_gated_session_answers_queries_then_starts() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut worker_end, mut server) = tokio::io::duplex(64 * 1024);
+        let (gate_tx, mut gate_rx) = mpsc::channel(1);
+        let serve = tokio::spawn(async move {
+            WorkerState::serve_gate(
+                &mut gate_rx,
+                &mut worker_end,
+                crate::protocol::framing::MAX_MESSAGE_SIZE,
+            )
+            .await
+        });
+
+        let reply = gated_query(&gate_tx, "IDENTIFY_SYSTEM").await;
+        let (tag, payload) = read_frontend(&mut server).await;
+        assert_eq!(tag, b'Q');
+        assert_eq!(payload, b"IDENTIFY_SYSTEM\0");
+        let mut answer = frame(b'T', &[0, 0]);
+        answer.extend(data_row(&[
+            Some(b"7"),
+            Some(b"2"),
+            Some(b"0/16B3748"),
+            None,
+        ]));
+        answer.extend(frame(b'C', b"IDENTIFY_SYSTEM\0"));
+        answer.extend(frame(b'Z', b"I"));
+        server.write_all(&answer).await.unwrap();
+        let rows = reply.await.unwrap().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0].as_deref(), Some(&b"7"[..]));
+        assert_eq!(rows[0][3], None, "NULL stays NULL");
+
+        gate_tx.send(GateCommand::Start).await.unwrap();
+        assert!(
+            matches!(serve.await.unwrap(), Ok(true)),
+            "Start ends the gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_error_keeps_the_gated_session_usable() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut worker_end, mut server) = tokio::io::duplex(64 * 1024);
+        let (gate_tx, mut gate_rx) = mpsc::channel(1);
+        let serve = tokio::spawn(async move {
+            WorkerState::serve_gate(
+                &mut gate_rx,
+                &mut worker_end,
+                crate::protocol::framing::MAX_MESSAGE_SIZE,
+            )
+            .await
+        });
+
+        let reply = gated_query(&gate_tx, "TIMELINE_HISTORY 1").await;
+        read_frontend(&mut server).await;
+        let mut answer = frame(b'E', b"Mno history\0\0");
+        answer.extend(frame(b'Z', b"I"));
+        server.write_all(&answer).await.unwrap();
+        assert!(matches!(reply.await.unwrap(), Err(PgWireError::Server(_))));
+
+        let reply = gated_query(&gate_tx, "SELECT 1").await;
+        read_frontend(&mut server).await;
+        let mut answer = data_row(&[Some(b"1")]);
+        answer.extend(frame(b'Z', b"I"));
+        server.write_all(&answer).await.unwrap();
+        assert_eq!(reply.await.unwrap().unwrap().len(), 1);
+
+        drop(gate_tx);
+        assert!(matches!(serve.await.unwrap(), Ok(false)));
+    }
+
+    #[tokio::test]
+    async fn a_closed_gate_terminates_without_starting() {
+        let (mut worker_end, mut server) = tokio::io::duplex(64 * 1024);
+        let (gate_tx, mut gate_rx) = mpsc::channel::<GateCommand>(1);
+        drop(gate_tx);
+        let started = WorkerState::serve_gate(
+            &mut gate_rx,
+            &mut worker_end,
+            crate::protocol::framing::MAX_MESSAGE_SIZE,
+        )
+        .await
+        .unwrap();
+        assert!(!started);
+        assert_eq!(read_frontend(&mut server).await.0, b'X', "Terminate sent");
+    }
+
+    #[tokio::test]
+    async fn a_broken_session_ends_the_gate_with_its_error() {
+        let (mut worker_end, server) = tokio::io::duplex(64 * 1024);
+        let (gate_tx, mut gate_rx) = mpsc::channel(1);
+        let serve = tokio::spawn(async move {
+            WorkerState::serve_gate(
+                &mut gate_rx,
+                &mut worker_end,
+                crate::protocol::framing::MAX_MESSAGE_SIZE,
+            )
+            .await
+        });
+        let reply = gated_query(&gate_tx, "IDENTIFY_SYSTEM").await;
+        drop(server);
+        assert!(reply.await.unwrap().is_err());
+        assert!(serve.await.unwrap().is_err(), "the session ends");
+    }
+
+    #[tokio::test]
+    async fn a_gated_query_row_over_the_limit_ends_the_session() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut worker_end, mut server) = tokio::io::duplex(64 * 1024);
+        let (gate_tx, mut gate_rx) = mpsc::channel(1);
+        let serve = tokio::spawn(async move {
+            WorkerState::serve_gate(&mut gate_rx, &mut worker_end, 64).await
+        });
+
+        let reply = gated_query(&gate_tx, "SELECT big").await;
+        read_frontend(&mut server).await;
+        let mut answer = data_row(&[Some(&[b'x'; 200])]);
+        answer.extend(frame(b'Z', b"I"));
+        server.write_all(&answer).await.unwrap();
+        assert!(matches!(
+            reply.await.unwrap(),
+            Err(PgWireError::MessageTooLarge {
+                limit_bytes: 64,
+                ..
+            })
+        ));
+        assert!(
+            matches!(
+                serve.await.unwrap(),
+                Err(PgWireError::MessageTooLarge { .. })
+            ),
+            "the session ends"
+        );
+    }
+
+    #[test]
+    fn a_malformed_data_row_is_a_protocol_error() {
+        let truncated = Bytes::from_static(&[0, 1, 0, 0, 0, 5, b'a']);
+        assert!(matches!(
+            parse_data_row(&truncated),
+            Err(PgWireError::Protocol(_))
+        ));
     }
 
     #[tokio::test]
@@ -1275,5 +1851,465 @@ mod tests {
 
         let _ = stop_tx.send(true);
         let _ = worker_task.await;
+    }
+
+    // ── Change-driven standby status updates ──────────────────────────────
+
+    /// A KeepAlive ('k') CopyData frame.
+    fn keepalive_frame(wal_end: u64, reply_requested: bool) -> Vec<u8> {
+        let mut payload = vec![b'k'];
+        payload.extend_from_slice(&(wal_end as i64).to_be_bytes());
+        payload.extend_from_slice(&0i64.to_be_bytes());
+        payload.push(u8::from(reply_requested));
+        let mut frame = vec![b'd'];
+        frame.extend_from_slice(&((payload.len() + 4) as i32).to_be_bytes());
+        frame.extend_from_slice(&payload);
+        frame
+    }
+
+    /// A status update read by the scripted server.
+    #[derive(Debug, PartialEq)]
+    struct Status {
+        applied: u64,
+        reply: bool,
+    }
+
+    /// The scripted server end of a worker's stream.
+    struct Server {
+        end: tokio::io::DuplexStream,
+        reader: MessageReader,
+    }
+
+    impl Server {
+        /// The next standby status update, skipping anything else.
+        async fn status(&mut self) -> Status {
+            loop {
+                let msg = self.reader.read(&mut self.end).await.expect("stream open");
+                if msg.tag == b'd' && msg.payload.first() == Some(&b'r') {
+                    let p = &msg.payload;
+                    return Status {
+                        applied: u64::from_be_bytes(p[1..9].try_into().unwrap()),
+                        reply: p[33] == 1,
+                    };
+                }
+            }
+        }
+
+        /// No status update arrives within `within`.
+        async fn quiet(&mut self, within: std::time::Duration) -> bool {
+            tokio::time::timeout(within, self.status()).await.is_err()
+        }
+
+        async fn send(&mut self, frame: &[u8]) {
+            use tokio::io::AsyncWriteExt;
+            self.end.write_all(frame).await.unwrap();
+            self.end.flush().await.unwrap();
+        }
+    }
+
+    struct Running {
+        /// When the worker was started (tokio's clock).
+        started: Instant,
+        server: Server,
+        task: tokio::task::JoinHandle<Result<()>>,
+        stop: watch::Sender<bool>,
+        _events: mpsc::Receiver<std::result::Result<ReplicationEvent, PgWireError>>,
+    }
+
+    fn feedback_cfg() -> ReplicationConfig {
+        ReplicationConfig {
+            status_interval: std::time::Duration::from_secs(1),
+            idle_wakeup_interval: std::time::Duration::from_secs(10),
+            ..Default::default()
+        }
+    }
+
+    /// Run `stream_loop` against a scripted server over a duplex of `capacity`
+    /// bytes.
+    fn run_stream(progress: &Arc<SharedProgress>, capacity: usize) -> Running {
+        run_stream_with(feedback_cfg(), progress, capacity)
+    }
+
+    fn run_stream_with(
+        cfg: ReplicationConfig,
+        progress: &Arc<SharedProgress>,
+        capacity: usize,
+    ) -> Running {
+        let (stop, stop_rx) = watch::channel(false);
+        let (tx, events) = mpsc::channel(16);
+        let mut worker = WorkerState::new(
+            cfg,
+            Arc::clone(progress),
+            stop_rx,
+            tx,
+            Arc::new(ReplicationMetrics::default()),
+        );
+        let (worker_end, end) = tokio::io::duplex(capacity);
+        let task = tokio::spawn(async move {
+            let mut buf = BufReader::with_capacity(1024, worker_end);
+            worker.stream_loop(&mut buf).await
+        });
+        Running {
+            started: Instant::now(),
+            server: Server {
+                end,
+                reader: MessageReader::new(),
+            },
+            task,
+            stop,
+            _events: events,
+        }
+    }
+
+    const SECOND: std::time::Duration = std::time::Duration::from_secs(1);
+
+    #[tokio::test(start_paused = true)]
+    async fn an_update_is_sent_within_the_status_interval() {
+        let progress = Arc::new(SharedProgress::new(Lsn(0)));
+        let mut r = run_stream(&progress, 64 * 1024);
+        assert_eq!(
+            r.server.status().await,
+            Status {
+                applied: 0,
+                reply: false
+            }
+        );
+        // Idle with nothing new: no status before the idle wakeup.
+        assert!(r.server.quiet(3 * SECOND).await);
+
+        // The interval since the last status has passed: sent at once.
+        let t = Instant::now();
+        progress.update_applied(Lsn(100));
+        assert_eq!(
+            r.server.status().await,
+            Status {
+                applied: 100,
+                reply: false
+            }
+        );
+        assert!(t.elapsed() < SECOND);
+
+        // The next one waits for the interval, no longer.
+        progress.update_applied(Lsn(200));
+        let t = Instant::now();
+        assert_eq!(
+            r.server.status().await,
+            Status {
+                applied: 200,
+                reply: false
+            }
+        );
+        assert!(t.elapsed() <= SECOND, "took {:?}", t.elapsed());
+        r.task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn coalesced_updates_send_the_newest_once() {
+        let progress = Arc::new(SharedProgress::new(Lsn(0)));
+        let mut r = run_stream(&progress, 64 * 1024);
+        assert_eq!(r.server.status().await.applied, 0);
+        let t = Instant::now();
+        for lsn in 1..=100 {
+            progress.update_applied(Lsn(lsn));
+        }
+        assert_eq!(
+            r.server.status().await,
+            Status {
+                applied: 100,
+                reply: false
+            }
+        );
+        assert!(t.elapsed() <= SECOND);
+        // Nothing else until the idle wakeup.
+        assert!(r.server.quiet(8 * SECOND).await);
+        r.task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_update_during_a_send_stays_pending() {
+        let progress = Arc::new(SharedProgress::new(Lsn(0)));
+        // Too small for one status message: the first send blocks mid-write.
+        let mut r = run_stream(&progress, 8);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        progress.update_applied(Lsn(300));
+        // The blocked send carries the position loaded before the update...
+        assert_eq!(r.server.status().await.applied, 0);
+        // ...and the update follows within the interval.
+        let t = Instant::now();
+        assert_eq!(r.server.status().await.applied, 300);
+        assert!(t.elapsed() <= SECOND);
+        r.task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_new_session_starts_with_the_newest_position() {
+        let progress = Arc::new(SharedProgress::new(Lsn(0)));
+        progress.update_applied(Lsn(500));
+        let mut r = run_stream(&progress, 64 * 1024);
+        assert_eq!(r.server.status().await.applied, 500);
+        r.task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_send_leaves_the_position_for_the_next_session() {
+        let progress = Arc::new(SharedProgress::new(Lsn(0)));
+        let mut r = run_stream(&progress, 64 * 1024);
+        assert_eq!(r.server.status().await.applied, 0);
+        progress.update_applied(Lsn(700));
+        // The server goes away before the pending status is written.
+        drop(r.server);
+        let ended = tokio::time::timeout(2 * SECOND, r.task).await.unwrap();
+        assert!(ended.unwrap().is_err(), "the failed send ends the session");
+        let mut next = run_stream(&progress, 64 * 1024);
+        assert_eq!(next.server.status().await.applied, 700);
+        next.task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_keepalive_requesting_a_reply_is_answered_at_once() {
+        let progress = Arc::new(SharedProgress::new(Lsn(40)));
+        let mut r = run_stream(&progress, 64 * 1024);
+        assert_eq!(r.server.status().await.applied, 40);
+        // No local change, inside the status interval.
+        let t = Instant::now();
+        r.server.send(&keepalive_frame(90, true)).await;
+        assert_eq!(
+            r.server.status().await,
+            Status {
+                applied: 40,
+                reply: true
+            }
+        );
+        assert!(t.elapsed() < SECOND);
+        r.task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_completely_idle_connection_keeps_sending_status() {
+        let progress = Arc::new(SharedProgress::new(Lsn(10)));
+        let mut r = run_stream(&progress, 64 * 1024);
+        let t = Instant::now();
+        let mut statuses = 0;
+        while t.elapsed() < std::time::Duration::from_secs(65) {
+            assert_eq!(r.server.status().await.applied, 10);
+            statuses += 1;
+        }
+        // One at start, then one per idle wakeup (10 s): not none, which
+        // would let wal_sender_timeout disconnect, and not one per interval.
+        assert!((6..=8).contains(&statuses), "{statuses} statuses in 65 s");
+        assert!(!r.task.is_finished());
+        r.task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stopping_with_the_timer_armed_ends_at_once() {
+        let progress = Arc::new(SharedProgress::new(Lsn(0)));
+        let mut r = run_stream(&progress, 64 * 1024);
+        assert_eq!(r.server.status().await.applied, 0);
+        progress.update_applied(Lsn(900)); // pending until the interval passes
+        let t = Instant::now();
+        r.stop.send(true).unwrap();
+        let ended = tokio::time::timeout(SECOND, r.task)
+            .await
+            .expect("the worker ends without waiting for the timer");
+        assert!(ended.unwrap().is_ok());
+        assert!(t.elapsed() < SECOND);
+    }
+
+    /// Raises from another thread race the worker clearing its signal and
+    /// reading the position: whatever the interleaving, the newest position of
+    /// every burst is sent within the status interval once the burst ends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn racing_raises_never_strand_the_newest_position() {
+        use std::time::Duration;
+        let interval = Duration::from_millis(50);
+        let cfg = ReplicationConfig {
+            status_interval: interval,
+            idle_wakeup_interval: Duration::from_secs(60),
+            ..Default::default()
+        };
+        let progress = Arc::new(SharedProgress::new(Lsn(0)));
+        let mut r = run_stream_with(cfg, &progress, 64 * 1024);
+        let mut newest = 0u64;
+        for burst in 0..50u64 {
+            let p = Arc::clone(&progress);
+            let from = newest;
+            let len = 1 + (burst * 7919) % 5000;
+            newest = std::thread::spawn(move || {
+                for lsn in from + 1..=from + len {
+                    p.update_applied(Lsn(lsn));
+                }
+                from + len
+            })
+            .join()
+            .unwrap();
+            let ended = Instant::now();
+            loop {
+                let status = tokio::time::timeout(4 * interval, r.server.status())
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!("burst {burst}: {newest} not sent within {:?}", 4 * interval)
+                    });
+                if status.applied == newest {
+                    break;
+                }
+                assert!(status.applied < newest);
+            }
+            assert!(ended.elapsed() <= 4 * interval);
+        }
+        r.task.abort();
+    }
+
+    // ── Feedback observer ─────────────────────────────────────────────────
+
+    type Seen = Arc<std::sync::Mutex<Vec<std::time::Duration>>>;
+
+    fn observed_cfg() -> (ReplicationConfig, Seen) {
+        let seen: Seen = Arc::default();
+        let sink = Arc::clone(&seen);
+        let cfg = feedback_cfg().with_feedback_observer(crate::FeedbackObserver::new(move |s| {
+            sink.lock().unwrap().push(s.pending_for)
+        }));
+        (cfg, seen)
+    }
+
+    fn seen(s: &Seen) -> Vec<std::time::Duration> {
+        s.lock().unwrap().clone()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_observer_reports_how_long_a_position_waited() {
+        let (cfg, s) = observed_cfg();
+        let progress = Arc::new(SharedProgress::with_timing(Lsn(0), true));
+        let mut r = run_stream_with(cfg, &progress, 64 * 1024);
+        assert_eq!(r.server.status().await.applied, 0);
+        assert!(
+            seen(&s).is_empty(),
+            "nothing was pending at the first status"
+        );
+        assert!(r.server.quiet(3 * SECOND).await);
+
+        // Due at once: no wait.
+        progress.update_applied(Lsn(100));
+        assert_eq!(r.server.status().await.applied, 100);
+        // Waits for the interval.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        progress.update_applied(Lsn(200));
+        assert_eq!(r.server.status().await.applied, 200);
+        assert_eq!(
+            seen(&s),
+            vec![
+                std::time::Duration::ZERO,
+                std::time::Duration::from_millis(900)
+            ]
+        );
+        r.task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn coalesced_raises_report_the_oldest_wait() {
+        let (cfg, s) = observed_cfg();
+        let progress = Arc::new(SharedProgress::with_timing(Lsn(0), true));
+        let mut r = run_stream_with(cfg, &progress, 64 * 1024);
+        assert_eq!(r.server.status().await.applied, 0);
+        for (at_ms, lsn) in [(100, 1), (500, 2), (900, 3)] {
+            tokio::time::sleep_until(r.started + std::time::Duration::from_millis(at_ms)).await;
+            progress.update_applied(Lsn(lsn));
+        }
+        assert_eq!(r.server.status().await.applied, 3);
+        assert_eq!(seen(&s), vec![std::time::Duration::from_millis(900)]);
+        r.task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_observation_when_the_position_does_not_advance() {
+        let (cfg, s) = observed_cfg();
+        let progress = Arc::new(SharedProgress::with_timing(Lsn(40), true));
+        let mut r = run_stream_with(cfg, &progress, 64 * 1024);
+        assert_eq!(r.server.status().await.applied, 40);
+        r.server.send(&keepalive_frame(90, true)).await;
+        assert!(r.server.status().await.reply);
+        progress.update_applied(Lsn(40)); // not a raise
+        for _ in 0..3 {
+            r.server.status().await; // idle wakeups
+        }
+        assert!(seen(&s).is_empty());
+        assert_eq!(progress.pending_since(), None);
+        r.task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_write_carries_its_wait_into_the_next_session() {
+        let (cfg, s) = observed_cfg();
+        let progress = Arc::new(SharedProgress::with_timing(Lsn(0), true));
+        let mut r = run_stream_with(cfg.clone(), &progress, 64 * 1024);
+        assert_eq!(r.server.status().await.applied, 0);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        progress.update_applied(Lsn(700));
+        drop(r.server);
+        assert!(r.task.await.unwrap().is_err(), "the write fails");
+        let since = progress.pending_since().expect("still pending");
+
+        // The replacement session starts from the acknowledged position and
+        // carries the pending start over.
+        tokio::time::sleep(2 * SECOND).await;
+        let next = Arc::new(SharedProgress::with_timing(Lsn(700), true));
+        next.carry_pending(since);
+        let mut r = run_stream_with(cfg, &next, 64 * 1024);
+        assert_eq!(r.server.status().await.applied, 700);
+        let waited = seen(&s);
+        assert_eq!(waited.len(), 1);
+        assert!(waited[0] >= 2 * SECOND, "{waited:?}");
+        r.task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nothing_is_timed_without_an_observer() {
+        let progress = Arc::new(SharedProgress::with_timing(Lsn(0), false));
+        progress.update_applied(Lsn(5));
+        assert_eq!(progress.pending_since(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_raise_during_a_write_keeps_a_pending_start() {
+        let (cfg, s) = observed_cfg();
+        let progress = Arc::new(SharedProgress::with_timing(Lsn(0), true));
+        progress.update_applied(Lsn(1));
+        // Too small for one status message: the first write blocks.
+        let mut r = run_stream_with(cfg, &progress, 8);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        progress.update_applied(Lsn(2));
+        assert_eq!(r.server.status().await.applied, 1);
+        assert_eq!(r.server.status().await.applied, 2);
+        assert_eq!(seen(&s).len(), 2, "both waits are reported");
+        r.task.abort();
+    }
+
+    /// A write that repeats the reported position (an idle wakeup) completing
+    /// while a newer raise is pending does not report that raise; the write
+    /// that carries it does, once.
+    #[tokio::test(start_paused = true)]
+    async fn a_repeated_position_does_not_report_a_pending_raise() {
+        let (cfg, s) = observed_cfg();
+        let progress = Arc::new(SharedProgress::with_timing(Lsn(40), true));
+        // Too small for one status message: writes block until read.
+        let mut r = run_stream_with(cfg, &progress, 8);
+        assert_eq!(r.server.status().await.applied, 40);
+        // The idle wakeup (10 s) writes 40 again and blocks unread; raise
+        // while it is in flight.
+        tokio::time::sleep_until(r.started + std::time::Duration::from_millis(10_500)).await;
+        progress.update_applied(Lsn(50));
+        assert_eq!(r.server.status().await.applied, 40);
+        assert!(
+            seen(&s).is_empty(),
+            "the repeated position reported nothing"
+        );
+        assert_eq!(r.server.status().await.applied, 50);
+        assert_eq!(seen(&s).len(), 1);
+        r.task.abort();
     }
 }

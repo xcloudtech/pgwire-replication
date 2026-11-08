@@ -17,6 +17,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.5.0] - 2026-10-19
+
+### Breaking changes
+- `PgWireError` is now `#[non_exhaustive]`: an exhaustive `match` needs a `_` arm.
+- New `PgWireError::MessageTooLarge` variant. An oversized message now fails with it instead of `PgWireError::Protocol("backend message too large ...")`, so code that matched `Protocol` or its text for this case must match `MessageTooLarge` (or use `is_message_too_large()`). Refusing an oversized message is also terminal (see Changed).
+- New `ReplicationConfig` fields and builders: `ack_lsn` / `with_ack_lsn`, `application_name` / `with_application_name`, `max_message_size` / `with_max_message_size`, `feedback_observer` / `with_feedback_observer`. `ReplicationConfig` is `#[non_exhaustive]`, so code using `new()` / `unix()` and the `with_*` builders compiles unchanged.
+- New `ReplicationClient` APIs: `wait_started`, `connect_gated`, `simple_query`, `identify_system`, `timeline_history`, `start`, `feedback_pending_since`, `carry_feedback_pending`; new public types `FeedbackObserver`, `FeedbackSent`, `IdentifySystem`, `TimelineHistory`, `QueryRow`; `PgWireError::is_message_too_large()`; `MessageReader::with_max_message_size()`.
+- Standby feedback timing changed: an acknowledged LSN is now sent within `status_interval`, also on an idle stream (see Changed).
+
+### Added
+- **Gated sessions**: `ReplicationClient::connect_gated` connects and authenticates, then waits before `START_REPLICATION`. On that one session, `simple_query` runs SQL or replication commands (a server error leaves the session usable), and `identify_system` / `timeline_history` parse `IDENTIFY_SYSTEM` and `TIMELINE_HISTORY`. `start` then sends `START_REPLICATION`. What a consumer reads before the start describes the server the stream opens on, with no window for a failover in between. Dropping the client before `start` ends the session. Query results are bounded by `max_message_size` like the replication stream: a larger row is refused with `MessageTooLarge` and ends the session.
+- **Startup `application_name`**: `ReplicationConfig::application_name` / `with_application_name()` set the name shown in `pg_stat_activity` and `pg_stat_replication`, so a consumer can tell its own walsender from other sessions. Unset, it stays `pgwire-replication`.
+- **Start confirmation**: `ReplicationClient::wait_started` waits until the server has accepted `START_REPLICATION`, when the slot is held by the session, and returns the worker's error if it ended first. `connect` returns before that, since connecting, authentication and `START_REPLICATION` run in the background worker.
+- **Initial acknowledged position**: `ReplicationConfig::ack_lsn` / `with_ack_lsn()` set the LSN reported as flushed and applied until the consumer calls `update_applied_lsn`. By default it is `start_lsn`, as before. A consumer that resumes reading from a position it has not made durable sets it to its durable position, so the slot's `confirmed_flush_lsn` never passes what it could recover from after a crash.
+- **Configurable message size limit**: `ReplicationConfig::max_message_size` / `with_max_message_size()` bound the largest backend message payload the worker accepts, measured as the length field minus 4 (so the tag and length field are excluded). The payload buffer is sized from the length the server announces, so this caps the memory one message can take; a larger message is refused before any of it is buffered. `MessageReader::with_max_message_size()` exposes the same limit for direct use. Defaults to the existing 1 GiB `MAX_MESSAGE_SIZE`, so behavior is unchanged unless set, and can only lower the limit: a larger value is capped to `MAX_MESSAGE_SIZE`. It bounds exactly one backend-message payload allocation — not an entire transaction, the event channel or decoded-event buffers, total process memory, or aggregate memory across connections. A payload exactly at the limit occupies `max_message_size + 5` bytes on the wire.
+- **`PgWireError::MessageTooLarge { payload_bytes, limit_bytes }`**: a refused message now reports both sizes as a typed variant instead of a formatted `Protocol` string, so a configured limit exceeded by a legitimate frame can be told apart from malformed framing without parsing error text. Non-transient, with an `is_message_too_large()` predicate alongside the existing ones.
+- **Feedback observer**: `ReplicationConfig::with_feedback_observer` takes a `FeedbackObserver` callback, called after each successful standby status update that advanced the reported position, with `FeedbackSent::pending_for`: how long that position waited, from the oldest raise it is the first to report. Coalesced raises keep the oldest start; a failed write keeps it, and `ReplicationClient::feedback_pending_since` / `carry_feedback_pending` carry it into a replacement session. No clock is read without an observer, and only for raises that advance the position. Positions are not exposed.
+
+### Changed
+- **BREAKING**: `PgWireError` is now `#[non_exhaustive]`. Exhaustive `match` on it needs a `_` arm; future variants can then be added without another breaking release.
+- **BREAKING**: refusing an oversized message is terminal. The refused payload is left on the wire rather than skipped, because it may carry WAL changes that must not be silently dropped — skipping it would let a direct `MessageReader` caller retry and continue with missing data. Every subsequent `read()` returns the same `MessageTooLarge`, so the reader and its connection must be discarded. The replication worker already ends the stream on the first error. A bogus length field therefore cannot make the reader consume an arbitrary number of bytes to resynchronize.
+- **Change-driven standby feedback**: `update_applied_lsn` now wakes the worker, which sends the new applied LSN once `status_interval` has passed since its last standby status update, also on an idle stream. Previously an idle stream reported it only at the next `idle_wakeup_interval` wakeup, server message or keepalive reply request, so a consumer acknowledging after traffic stopped could hold WAL for that long. Updates coalesce into one status carrying the newest LSN; no wakeup is added while nothing new is pending, and `update_applied_lsn` stays a compare-and-swap plus one atomic load except for the first raise after the worker last looked. Keepalive replies, idle wakeup feedback and feedback under backpressure are unchanged.
+
+### Fixed
+- `ReplicationConfig::status_interval` documented a 1 second default; the default is 10 seconds. The README now describes change-driven feedback on an idle stream.
+- The README and example headers told users to pass `--features examples`, which does not exist (cargo rejects it); examples run with plain `cargo run --example <name>`. The README now covers the 0.5 features, error handling and upgrading from 0.4.
+
+### Notes
+- No new runtime dependencies; MSRV stays 1.88. `loom` (under `cfg(pgwire_loom)`) and tokio's `test-util` are dev-only.
+- CI runs a `loom` model of the progress signalling that `update_applied_lsn` and the worker share, and a test that the public types keep `Send`, `Sync`, `Unpin`, `UnwindSafe` and `RefUnwindSafe`.
+
+---
+
+## [0.4.1] - 2026-09-21
+
+### Added
+- **Startup `options` parameter**: `ReplicationConfig::options` / `with_options()` let callers set the startup `options` parameter on the replication connection, the same as `libpq`'s `options` connection parameter (or `PGOPTIONS`) on an ordinary connection. PostgreSQL honors `options` on replication connections too, so this is useful for pinning session GUCs (e.g. `DateStyle`, `IntervalStyle`) so that values decoded from the replication stream are rendered the same way as values read through a regular connection with the same GUCs pinned. Omitted from the startup message entirely when unset, so behavior is unchanged by default.
+
+### Fixed
+- Test-only clippy lint (byte-string literal) that landed after the `v0.4.0` tag and was therefore missing from the published 0.4.0 crate.
+
+---
+
 ## [0.4.0] - 2026-07-14
 
 ### Added
@@ -144,7 +187,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Fuzz testing for pgwire framing
 
 
-[Unreleased]: https://github.com/vnvo/pgwire-replication/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/vnvo/pgwire-replication/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/vnvo/pgwire-replication/compare/v0.4.1...v0.5.0
+[0.4.1]: https://github.com/vnvo/pgwire-replication/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/vnvo/pgwire-replication/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/vnvo/pgwire-replication/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/vnvo/pgwire-replication/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/vnvo/pgwire-replication/compare/v0.2.0...v0.3.0

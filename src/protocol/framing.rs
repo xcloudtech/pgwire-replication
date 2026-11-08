@@ -6,6 +6,9 @@ use crate::error::{PgWireError, Result};
 
 /// Maximum backend message size (1GB) - prevents memory exhaustion from malformed length fields
 /// This is more than enough.
+///
+/// The default for [`MessageReader`] and for
+/// [`ReplicationConfig::max_message_size`](crate::config::ReplicationConfig::max_message_size).
 pub const MAX_MESSAGE_SIZE: usize = 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +76,13 @@ pub struct MessageReader {
     /// `None` after each completed message.
     payload_len: Option<usize>,
     tag: u8,
+    /// Largest payload accepted; a longer message is refused before any of
+    /// it is buffered.
+    max_payload: usize,
+    /// Set once a message has been refused for exceeding `max_payload`.
+    /// The refused payload is still on the wire and is never consumed, so
+    /// the reader cannot resynchronize: every later read fails the same way.
+    refused: Option<(usize, usize)>,
 }
 
 impl MessageReader {
@@ -88,7 +98,26 @@ impl MessageReader {
             payload_filled: 0,
             payload_len: None,
             tag: 0,
+            max_payload: MAX_MESSAGE_SIZE,
+            refused: None,
         }
+    }
+
+    /// Refuse any message whose payload is larger than `max` bytes.
+    ///
+    /// `max` is compared against the message's length field minus 4, so it
+    /// excludes the tag and the length field itself. The payload buffer is
+    /// sized from the length the server announces, so this bounds the memory
+    /// one message can take. It can only lower the limit: a value above
+    /// [`MAX_MESSAGE_SIZE`], the default, is capped to it.
+    ///
+    /// A refused message is terminal. Its payload is left on the wire, so the
+    /// reader cannot resynchronize and every later [`read`](Self::read)
+    /// returns the same [`PgWireError::MessageTooLarge`]. Discard the reader
+    /// and the connection.
+    pub fn with_max_message_size(mut self, max: usize) -> Self {
+        self.max_payload = max.min(MAX_MESSAGE_SIZE);
+        self
     }
 
     /// Read the next complete backend message.
@@ -96,6 +125,17 @@ impl MessageReader {
     /// Cancellation-safe: dropping the returned future preserves all progress
     /// so far on `self`. Re-call to resume.
     pub async fn read<R: AsyncRead + Unpin>(&mut self, rd: &mut R) -> Result<BackendMessage> {
+        // Phase 0: a refused message is terminal. Its payload is still on the
+        // wire and carries WAL data we must not skip past, so there is nothing
+        // to resynchronize to — fail the same way until the caller discards
+        // this reader and its connection.
+        if let Some((payload_bytes, limit_bytes)) = self.refused {
+            return Err(PgWireError::MessageTooLarge {
+                payload_bytes,
+                limit_bytes,
+            });
+        }
+
         // Phase 1: fill the 5-byte header
         while self.hdr_filled < 5 {
             let n = rd.read(&mut self.hdr[self.hdr_filled..]).await?;
@@ -123,11 +163,13 @@ impl MessageReader {
 
             let payload_len = (len - 4) as usize;
 
-            if payload_len > MAX_MESSAGE_SIZE {
+            if payload_len > self.max_payload {
                 self.hdr_filled = 0;
-                return Err(PgWireError::Protocol(format!(
-                    "backend message too large: {payload_len} bytes (max {MAX_MESSAGE_SIZE})"
-                )));
+                self.refused = Some((payload_len, self.max_payload));
+                return Err(PgWireError::MessageTooLarge {
+                    payload_bytes: payload_len,
+                    limit_bytes: self.max_payload,
+                });
             }
 
             self.tag = self.hdr[0];
@@ -190,9 +232,10 @@ pub async fn read_backend_message_into<R: AsyncRead + Unpin>(
     let payload_len = (len - 4) as usize;
 
     if payload_len > MAX_MESSAGE_SIZE {
-        return Err(PgWireError::Protocol(format!(
-            "backend message too large: {payload_len} bytes (max {MAX_MESSAGE_SIZE})"
-        )));
+        return Err(PgWireError::MessageTooLarge {
+            payload_bytes: payload_len,
+            limit_bytes: MAX_MESSAGE_SIZE,
+        });
     }
 
     buf.clear();
@@ -442,6 +485,139 @@ mod tests {
         let mut reader = MessageReader::new();
         let err = reader.read(&mut cursor).await.unwrap_err();
         assert!(err.to_string().contains("invalid backend message length"));
+    }
+
+    #[tokio::test]
+    async fn message_reader_rejects_a_message_over_its_configured_limit() {
+        // A 10-byte payload against a limit of 8.
+        let data = [b'd', 0, 0, 0, 14];
+        let mut cursor = Cursor::new(&data[..]);
+
+        let mut reader = MessageReader::new().with_max_message_size(8);
+        let err = reader.read(&mut cursor).await.unwrap_err();
+        assert!(matches!(
+            err,
+            PgWireError::MessageTooLarge {
+                payload_bytes: 10,
+                limit_bytes: 8
+            }
+        ));
+        assert!(!err.is_transient());
+    }
+
+    #[tokio::test]
+    async fn message_reader_is_poisoned_after_refusing_an_oversized_message() {
+        // A 10-byte payload over the limit of 8, then a valid message that
+        // must never be handed out: the refused payload sits between them and
+        // may carry WAL changes, so skipping to the next frame would lose data.
+        let mut data = vec![b'd', 0, 0, 0, 14];
+        data.extend_from_slice(b"0123456789");
+        data.extend_from_slice(&[b'k', 0, 0, 0, 7]);
+        data.extend_from_slice(b"abc");
+        let mut cursor = Cursor::new(&data[..]);
+
+        let mut reader = MessageReader::new().with_max_message_size(8);
+        assert!(reader.read(&mut cursor).await.is_err());
+
+        for _ in 0..3 {
+            let err = reader.read(&mut cursor).await.unwrap_err();
+            assert!(matches!(
+                err,
+                PgWireError::MessageTooLarge {
+                    payload_bytes: 10,
+                    limit_bytes: 8
+                }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn message_reader_does_not_consume_a_refused_payload() {
+        // Nothing past the 5-byte header is read, so a bogus length cannot
+        // make the reader pull an arbitrary number of bytes off the wire.
+        let bogus = i32::MAX;
+        let mut data = vec![b'd'];
+        data.extend_from_slice(&bogus.to_be_bytes());
+        data.extend_from_slice(b"payload bytes that must stay on the wire");
+        let mut cursor = Cursor::new(&data[..]);
+
+        let mut reader = MessageReader::new().with_max_message_size(8);
+        assert!(reader.read(&mut cursor).await.is_err());
+        assert_eq!(cursor.position(), 5);
+    }
+
+    #[tokio::test]
+    async fn message_reader_reaches_the_oversized_verdict_across_a_cancelled_header() {
+        use tokio::io::AsyncWriteExt;
+
+        // 10_000-byte payload announced, against a limit of 8.
+        let len = 4 + 10_000i32;
+        let hdr = {
+            let mut v = vec![b'd'];
+            v.extend_from_slice(&len.to_be_bytes());
+            v
+        };
+
+        let (mut client, mut server) = tokio::io::duplex(64);
+        let mut reader = MessageReader::new().with_max_message_size(8);
+
+        // Two of the five header bytes arrive, then the read is cancelled
+        // while genuinely waiting for the rest.
+        server.write_all(&hdr[..2]).await.unwrap();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                reader.read(&mut client)
+            )
+            .await
+            .is_err(),
+            "expected the read to be waiting for the rest of the header"
+        );
+
+        // The rest arrives. If the first two bytes had been lost with the
+        // dropped future, this read would mis-parse or block instead.
+        server.write_all(&hdr[2..]).await.unwrap();
+        let err = tokio::time::timeout(std::time::Duration::from_secs(5), reader.read(&mut client))
+            .await
+            .expect("reader lost the partial header and is still waiting")
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            PgWireError::MessageTooLarge {
+                payload_bytes: 10_000,
+                limit_bytes: 8
+            }
+        ));
+
+        // The verdict is terminal even though it was reached across a
+        // cancellation: the payload arriving afterwards changes nothing.
+        server.write_all(&[b'x'; 32]).await.unwrap();
+        let err = reader.read(&mut client).await.unwrap_err();
+        assert!(matches!(
+            err,
+            PgWireError::MessageTooLarge {
+                payload_bytes: 10_000,
+                limit_bytes: 8
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn message_reader_accepts_a_message_at_its_configured_limit() {
+        let mut data = vec![b'd', 0, 0, 0, 12];
+        data.extend_from_slice(b"12345678");
+        let mut cursor = Cursor::new(&data[..]);
+
+        let mut reader = MessageReader::new().with_max_message_size(8);
+        let msg = reader.read(&mut cursor).await.unwrap();
+        assert_eq!(&msg.payload[..], b"12345678");
+    }
+
+    #[test]
+    fn message_reader_limit_cannot_be_raised_above_the_protocol_cap() {
+        let reader = MessageReader::new().with_max_message_size(usize::MAX);
+        assert_eq!(reader.max_payload, MAX_MESSAGE_SIZE);
     }
 
     #[tokio::test]

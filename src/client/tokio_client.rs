@@ -15,7 +15,31 @@ use std::sync::Arc;
 use crate::config::SslMode;
 
 use super::metrics::ReplicationMetrics;
-use super::worker::{ReplicationEvent, ReplicationEventReceiver, SharedProgress, WorkerState};
+use super::worker::{
+    GateCommand, QueryRow, ReplicationEvent, ReplicationEventReceiver, SharedProgress, WorkerState,
+};
+
+/// The IDENTIFY_SYSTEM answer of a replication session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentifySystem {
+    /// The cluster's system identifier (decimal text).
+    pub system_id: String,
+    /// The server's current timeline.
+    pub timeline: u32,
+    /// The current WAL flush location.
+    pub xlogpos: Lsn,
+    /// The session's database (`None` for a physical session).
+    pub dbname: Option<String>,
+}
+
+/// The TIMELINE_HISTORY answer: the history file of a timeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimelineHistory {
+    /// The history file's name, such as `00000002.history`.
+    pub filename: String,
+    /// The history file's contents.
+    pub content: bytes::Bytes,
+}
 
 /// PostgreSQL logical replication client.
 ///
@@ -70,6 +94,11 @@ pub struct ReplicationClient {
     stop_tx: watch::Sender<bool>,
     metrics: Arc<ReplicationMetrics>,
     join: Option<JoinHandle<std::result::Result<(), PgWireError>>>,
+    /// Becomes `true` once the server accepted START_REPLICATION.
+    started: watch::Receiver<bool>,
+    /// Commands to a gated session before START_REPLICATION. `None`: not
+    /// gated, or already started.
+    gate: Option<mpsc::Sender<GateCommand>>,
 }
 
 impl ReplicationClient {
@@ -90,12 +119,34 @@ impl ReplicationClient {
     /// - Unix socket does not exist (when host starts with `/`)
     /// - TLS requested with Unix socket connection
     pub async fn connect(cfg: ReplicationConfig) -> Result<Self> {
+        Self::spawn(cfg, None)
+    }
+
+    /// Connect and authenticate like [`connect`](Self::connect), but do not
+    /// start replication: the session waits for
+    /// [`simple_query`](Self::simple_query) (and the IDENTIFY_SYSTEM /
+    /// TIMELINE_HISTORY helpers) until [`start`](Self::start) sends
+    /// START_REPLICATION. Everything runs on the one authenticated session, so
+    /// what is read before the start describes the server the stream then
+    /// opens on. Dropping the client before `start` ends the session.
+    pub async fn connect_gated(cfg: ReplicationConfig) -> Result<Self> {
+        let (gate_tx, gate_rx) = mpsc::channel(1);
+        let mut client = Self::spawn(cfg, Some(gate_rx))?;
+        client.gate = Some(gate_tx);
+        Ok(client)
+    }
+
+    fn spawn(cfg: ReplicationConfig, gate: Option<mpsc::Receiver<GateCommand>>) -> Result<Self> {
         let (tx, rx) = mpsc::channel(cfg.buffer_events);
 
         // Progress is shared via atomics: cheap, monotonic, no async backpressure.
-        let progress = Arc::new(SharedProgress::new(cfg.start_lsn));
+        let progress = Arc::new(SharedProgress::with_timing(
+            cfg.ack_lsn.unwrap_or(cfg.start_lsn),
+            cfg.feedback_observer.is_some(),
+        ));
 
         let (stop_tx, stop_rx) = watch::channel(false);
+        let (started_tx, started_rx) = watch::channel(false);
 
         let metrics = Arc::new(ReplicationMetrics::default());
 
@@ -111,6 +162,10 @@ impl ReplicationClient {
                 tx,
                 metrics_for_worker,
             );
+            worker.notify_started(started_tx);
+            if let Some(gate) = gate {
+                worker.gate_before_start(gate);
+            }
             let res = run_worker(&mut worker, &cfg).await;
             if let Err(ref e) = res {
                 tracing::error!("replication worker terminated with error: {e}");
@@ -124,7 +179,111 @@ impl ReplicationClient {
             stop_tx,
             metrics,
             join: Some(join),
+            started: started_rx,
+            gate: None,
         })
+    }
+
+    /// Run `sql` with the simple query protocol on a gated session before
+    /// [`start`](Self::start); returns its rows (text format). A server error
+    /// leaves the session usable.
+    pub async fn simple_query(&mut self, sql: &str) -> Result<Vec<QueryRow>> {
+        let gate = self.gate.as_ref().ok_or_else(|| {
+            PgWireError::Internal("simple_query needs a gated session that has not started".into())
+        })?;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let sent = gate
+            .send(GateCommand::Query {
+                sql: sql.to_string(),
+                reply: reply_tx,
+            })
+            .await;
+        if sent.is_ok() {
+            if let Ok(result) = reply_rx.await {
+                return result;
+            }
+        }
+        // The worker ended (connect or authentication failed, or the session
+        // broke): report why.
+        self.gate = None;
+        match self.handle_worker_shutdown().await {
+            Err(e) => Err(e),
+            Ok(_) => Err(PgWireError::Internal(
+                "replication session ended before the query ran".into(),
+            )),
+        }
+    }
+
+    /// IDENTIFY_SYSTEM on a gated session.
+    pub async fn identify_system(&mut self) -> Result<IdentifySystem> {
+        let rows = self.simple_query("IDENTIFY_SYSTEM").await?;
+        let row = single_row(rows, 4, "IDENTIFY_SYSTEM")?;
+        let text = |i: usize| -> Result<String> {
+            row[i]
+                .as_ref()
+                .map(|b| String::from_utf8_lossy(b).into_owned())
+                .ok_or_else(|| {
+                    PgWireError::Protocol(format!("IDENTIFY_SYSTEM: column {i} is NULL"))
+                })
+        };
+        let timeline = text(1)?.parse::<u32>().map_err(|e| {
+            PgWireError::Protocol(format!("IDENTIFY_SYSTEM: invalid timeline: {e}"))
+        })?;
+        let xlogpos = Lsn::parse(&text(2)?)
+            .map_err(|e| PgWireError::Protocol(format!("IDENTIFY_SYSTEM: invalid xlogpos: {e}")))?;
+        Ok(IdentifySystem {
+            system_id: text(0)?,
+            timeline,
+            xlogpos,
+            dbname: text(3).ok(),
+        })
+    }
+
+    /// TIMELINE_HISTORY for `timeline` on a gated session (the server has no
+    /// history file for timeline 1).
+    pub async fn timeline_history(&mut self, timeline: u32) -> Result<TimelineHistory> {
+        let rows = self
+            .simple_query(&format!("TIMELINE_HISTORY {timeline}"))
+            .await?;
+        let mut row = single_row(rows, 2, "TIMELINE_HISTORY")?;
+        let null =
+            |i: usize| PgWireError::Protocol(format!("TIMELINE_HISTORY: column {i} is NULL"));
+        let content = row[1].take().ok_or_else(|| null(1))?;
+        let filename = row[0].take().ok_or_else(|| null(0))?;
+        Ok(TimelineHistory {
+            filename: String::from_utf8_lossy(&filename).into_owned(),
+            content,
+        })
+    }
+
+    /// Send START_REPLICATION on a gated session; then
+    /// [`wait_started`](Self::wait_started) reports whether the server
+    /// accepted it.
+    pub async fn start(&mut self) -> Result<()> {
+        let gate = self.gate.take().ok_or_else(|| {
+            PgWireError::Internal("start needs a gated session that has not started".into())
+        })?;
+        // A closed gate means the worker already ended; wait_started reports
+        // its error.
+        let _ = gate.send(GateCommand::Start).await;
+        Ok(())
+    }
+
+    /// Wait until the server has accepted START_REPLICATION: from then on the
+    /// replication slot is held by this session, and no other session can
+    /// acquire or advance it. [`connect`](Self::connect) returns before that,
+    /// as connecting, authentication and START_REPLICATION run in the
+    /// background worker. Returns the worker's error if it ended first.
+    pub async fn wait_started(&mut self) -> Result<()> {
+        if self.started.wait_for(|started| *started).await.is_ok() {
+            return Ok(());
+        }
+        match self.handle_worker_shutdown().await {
+            Err(e) => Err(e),
+            Ok(_) => Err(PgWireError::Internal(
+                "replication worker ended before replication started".into(),
+            )),
+        }
     }
 
     /// Receive the next replication event.
@@ -158,8 +317,9 @@ impl ReplicationClient {
     /// Update the applied/durable LSN reported to the server.
     ///
     /// Semantics: call this only once you have durably persisted all events up to `lsn`.
-    /// This update is monotonic and cheap; wire feedback is still governed by the worker’s
-    /// `status_interval` and keepalive reply requests.
+    /// This update is monotonic and cheap. A raised LSN wakes the worker, which sends it
+    /// once `status_interval` has passed since its last standby status update, also on an
+    /// idle stream; updates in between coalesce into one status carrying the newest LSN.
     ///
     /// Report [`Commit::end_lsn`](ReplicationEvent::Commit) and
     /// [`KeepAlive::wal_end`](ReplicationEvent::KeepAlive). Do **not** rely on
@@ -169,6 +329,24 @@ impl ReplicationClient {
     #[inline]
     pub fn update_applied_lsn(&self, lsn: Lsn) {
         self.progress.update_applied(lsn);
+    }
+
+    /// When the oldest applied-position raise not yet reported to the server
+    /// happened, with a feedback observer configured; `None` otherwise or
+    /// when everything raised was reported. Readable after the session ended,
+    /// so a caller replacing a failed session can carry it over with
+    /// [`carry_feedback_pending`](Self::carry_feedback_pending).
+    pub fn feedback_pending_since(&self) -> Option<std::time::Instant> {
+        self.progress.pending_since()
+    }
+
+    /// Carry over a pending start from a session this one replaces (from its
+    /// [`feedback_pending_since`](Self::feedback_pending_since)): the next
+    /// update that advances the reported position reports its wait from
+    /// there, or from an older start of this session. No effect without a
+    /// feedback observer.
+    pub fn carry_feedback_pending(&self, since: std::time::Instant) {
+        self.progress.carry_pending(since);
     }
 
     /// Returns a handle to the live replication metrics.
@@ -278,6 +456,17 @@ impl Drop for ReplicationClient {
                 }
             }
         }
+    }
+}
+
+/// The one row of a replication command's answer, with `columns` columns.
+fn single_row(rows: Vec<QueryRow>, columns: usize, command: &str) -> Result<QueryRow> {
+    let mut rows = rows.into_iter();
+    match (rows.next(), rows.next()) {
+        (Some(row), None) if row.len() >= columns => Ok(row),
+        _ => Err(PgWireError::Protocol(format!(
+            "{command}: expected one row of {columns} columns"
+        ))),
     }
 }
 

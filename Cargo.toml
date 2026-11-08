@@ -1,6 +1,6 @@
 [package]
 name = "pgwire-replication"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.88"
 resolver = "2"
@@ -72,8 +72,12 @@ tracing-subscriber = { version = "0.3", optional = true, features = [
     "env-filter",
 ] }
 
+[target.'cfg(pgwire_loom)'.dev-dependencies]
+loom = "0.7"
+
 [dev-dependencies]
 hex = "0.4"
+tokio = { version = "1", features = ["test-util"] }
 proptest = "1"
 tempfile = "3"
 tokio-postgres = "0.7"
@@ -98,3 +102,5 @@ name = "with_mtls"
 path = "examples/with_mtls.rs"
 required-features = ["tls-rustls"]
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(pgwire_loom)'] }
